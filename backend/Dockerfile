@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Ensure static and upload directories exist so Starlette StaticFiles mounts don't fail
+RUN mkdir -p /app/static /app/tmp_uploads
+
 # Create non-root user
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
