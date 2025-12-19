@@ -27,6 +27,8 @@ jobs:
           NEXT_PUBLIC_BACKEND_URL: ${{ secrets.BACKEND_URL }}
         run: |
           npm run build
+          # Ensure a static export exists at frontend/out for GitHub Pages
+          npx next export -o out
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
