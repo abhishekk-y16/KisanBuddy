@@ -33,4 +33,4 @@ jobs:
         with:
           publish_dir: frontend/out
           publish_branch: gh-pages
-          publish_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
