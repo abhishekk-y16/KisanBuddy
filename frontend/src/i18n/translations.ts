@@ -1,0 +1,40 @@
+const TRANSLATIONS: Record<string, Record<string, string>> = {
+  en: {
+    siteTitle: 'Kisan Mitra',
+    siteSubtitle: 'Agricultural intelligence',
+    cropHealth: 'Crop Health',
+    marketPrices: 'Market Prices',
+    weather: 'Weather',
+    chat: 'Chat',
+    scanLeaf: 'Scan a Leaf',
+    viewMandi: 'View Mandi Prices',
+    weatherRisks: 'Weather Risks',
+    activeAlerts: 'Active Alerts',
+    marketPrice: 'Market Price (Wheat/q)',
+    today: 'Today',
+    startDiagnosis: 'Start Diagnosis',
+    viewPrices: 'View Prices',
+    checkRisks: 'Check Risks',
+    quickActions: 'Quick Actions',
+  },
+  hi: {
+    siteTitle: 'किसान मित्र',
+    siteSubtitle: 'कृषि बुद्धिमत्ता',
+    cropHealth: 'फसल स्वास्थ्य',
+    marketPrices: 'मंडी भाव',
+    weather: 'मौसम',
+    chat: 'चैट',
+    scanLeaf: 'पत्ता स्कैन करें',
+    viewMandi: 'मंडी भाव देखें',
+    weatherRisks: 'मौसम जोखिम',
+    activeAlerts: 'सतर्कताएँ',
+    marketPrice: 'मंडी भाव (गेहूँ/q)',
+    today: 'आज',
+    startDiagnosis: 'रोग पहचान शुरू करें',
+    viewPrices: 'भाव देखें',
+    checkRisks: 'जोखिम जाँचें',
+    quickActions: 'तात्कालिक क्रियाएँ',
+  }
+};
+
+export default TRANSLATIONS;
