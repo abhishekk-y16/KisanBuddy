@@ -8,16 +8,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
-from .services.agmarknet import fetch_prices, forecast_prices
-from .services.anthrokrishi import query_parcel_by_plus_code, s2_cell_from_latlon
-from .services.earth_engine import fetch_hazards, fetch_ndvi_timeseries, init_earth_engine
-from .services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models
-from .services.sync import push_docs, pull_docs, hub as sync_hub
-from .agents.planner import plan_tasks
-from .agents.validator import validate_recommendations
-from .agents.orchestrator import create_orchestrator, AgentOrchestrator
-from .services.weather import fetch_weather, crop_advisories
-from . import auth as auth_module
+# Prefer top-level `services`/`agents` imports (works when app is run as a module
+# at project root or by Render). Fall back to package-relative imports when the
+# package layout is used (tests running `backend` as a package).
+try:
+    from services.agmarknet import fetch_prices, forecast_prices
+    from services.anthrokrishi import query_parcel_by_plus_code, s2_cell_from_latlon
+    from services.earth_engine import fetch_hazards, fetch_ndvi_timeseries, init_earth_engine
+    from services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models
+    from services.sync import push_docs, pull_docs, hub as sync_hub
+    from agents.planner import plan_tasks
+    from agents.validator import validate_recommendations
+    from agents.orchestrator import create_orchestrator, AgentOrchestrator
+    from services.weather import fetch_weather, crop_advisories
+    import auth as auth_module
+except Exception:
+    from backend.services.agmarknet import fetch_prices, forecast_prices
+    from backend.services.anthrokrishi import query_parcel_by_plus_code, s2_cell_from_latlon
+    from backend.services.earth_engine import fetch_hazards, fetch_ndvi_timeseries, init_earth_engine
+    from backend.services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models
+    from backend.services.sync import push_docs, pull_docs, hub as sync_hub
+    from backend.agents.planner import plan_tasks
+    from backend.agents.validator import validate_recommendations
+    from backend.agents.orchestrator import create_orchestrator, AgentOrchestrator
+    from backend.services.weather import fetch_weather, crop_advisories
+    from . import auth as auth_module
 from fastapi import Depends, Header
 
 app = FastAPI(title="Kisan-Mitra API", version="0.2.0")
