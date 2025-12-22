@@ -57,3 +57,8 @@ frontend/out
 venv
 __pycache__
 *.pyc
+# Ignore Next build artifacts inside frontend
+frontend/.next
+frontend/out
+frontend/public/sw.js
+frontend/public/workbox-4754cb34.js
