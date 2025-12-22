@@ -6,10 +6,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "export": "next export",
+    "export": "echo \"Note: Next.js 14 uses 'output: \"export\"' in next.config.js — static export is produced during 'next build'. No separate 'next export' required.\"",
     "start": "next start",
     "lint": "next lint",
-    "deploy": "npm run build && npm run export && gh-pages -d out -b gh-pages"
+    "deploy": "npm run build && gh-pages -d out -b gh-pages"
   },
   "dependencies": {
     "@types/node": "^20.0.0",
