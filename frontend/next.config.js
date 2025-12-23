@@ -21,7 +21,7 @@ const nextConfig = {
   reactStrictMode: true,
   env: {
     NEXT_PUBLIC_API_URL:
-      process.env.NEXT_PUBLIC_API_URL || process.env.BACKEND_URL || 'https://kisanbuddy-coge.onrender.com',
+      process.env.NEXT_PUBLIC_API_URL || process.env.BACKEND_URL || 'https://kisanmitra-coge.onrender.com',
   },
 };
 
