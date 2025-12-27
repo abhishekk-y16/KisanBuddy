@@ -56,28 +56,19 @@ export default function ChatPage() {
               const payload: any = { message: chatMessage, language: 'en' };
               if (pref.imageUrl) payload.image_url = pref.imageUrl;
               else if (pref.imageBase64) payload.image_base64 = (pref.imageBase64.split(',')[1] ?? pref.imageBase64);
-              const base = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
-              const res = await fetch(`${base}/api/vision_chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-              const textResp = await res.text().catch(() => '');
-              if (!res.ok) {
-                if (res.status === 404) {
-                  setServiceWarning('Vision service not available — using text-only fallback.');
-                }
+              const { visionChat, chat } = await import('@/lib/api');
+              const res = await visionChat(payload);
+              if (res.error) {
                 // fallback to plain chat endpoint with image mention
+                if (res.error && res.error.includes('404')) setServiceWarning('Vision service not available — using text-only fallback.');
                 const fallbackMsg = `Image: ${pref.imageUrl ? pref.imageUrl : '[attached image]'}\n\n${chatMessage}`;
-                const r2 = await fetch(`${base}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: fallbackMsg }) });
-                if (!r2.ok) throw new Error('fallback chat failed');
-                const j2 = await r2.json();
-                setMessages((s) => [...s, { from: 'bot', text: j2.reply }]);
+                const r2 = await chat(fallbackMsg, 'en');
+                if (r2.error) throw new Error(r2.error);
+                setMessages((s) => [...s, { from: 'bot', text: r2.data?.reply || 'No reply' }]);
               } else {
-                // try parse json, otherwise use text
-                try {
-                  const j = JSON.parse(textResp || '{}');
-                  const reply = (j && (j.diagnosis || j.crop || j.reply)) ? formatVisionResponse(j) : (j.reply || textResp || 'No reply');
-                  setMessages((s) => [...s, { from: 'bot', text: reply }]);
-                } catch (e) {
-                  setMessages((s) => [...s, { from: 'bot', text: textResp || 'No reply' }]);
-                }
+                const j = res.data as any;
+                const reply = (j && (j.diagnosis || j.crop || j.reply)) ? formatVisionResponse(j) : (j?.reply || 'No reply');
+                setMessages((s) => [...s, { from: 'bot', text: reply }]);
               }
             } catch (e) {
               setServiceWarning('Chat service currently unavailable.');
@@ -124,7 +115,8 @@ export default function ChatPage() {
     setMessages((s) => [...s, { from: 'user', text: m }]);
     setText('');
     try {
-      const base = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+      const { getApiUrl } = await import('@/lib/api');
+      const base = getApiUrl();
       // If an image is attached and the user is asking to identify the crop,
       // call the vision-enabled chat endpoint so the model uses the image.
       const wantsIdentification = imagePreview && /\b(name|which|identify|what)\b/i.test(m) && /\b(crop|plant|this)\b/i.test(m);
@@ -132,34 +124,24 @@ export default function ChatPage() {
         const payload: any = { message: m, language: 'en' };
         if (imagePreview?.startsWith('data:')) payload.image_base64 = imagePreview.split(',')[1];
         else if (imagePreview) payload.image_url = imagePreview;
-        const res = await fetch(`${base}/api/vision_chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        const textResp = await res.text().catch(() => '');
-        if (!res.ok) {
-          if (res.status === 404) setServiceWarning('Vision service not available — falling back to text-only chat.');
-          // attempt graceful fallback to text-only chat
+        const { visionChat, chat } = await import('@/lib/api');
+        const res = await visionChat(payload);
+        if (res.error) {
+          if (res.error.includes('404')) setServiceWarning('Vision service not available — falling back to text-only chat.');
           const fallbackMsg = `${payload.message}` + (payload.image_url ? `\n\nImage: ${payload.image_url}` : '');
-          try {
-            const r2 = await fetch(`${base}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: fallbackMsg }) });
-            if (!r2.ok) throw new Error('fallback failed');
-            const j2 = await r2.json();
-            setMessages((s) => [...s, { from: 'bot', text: j2.reply }]);
-            return;
-          } catch (fallbackErr) {
-            throw new Error('vision chat failed and fallback failed');
-          }
+          const r2 = await chat(fallbackMsg, 'en');
+          if (r2.error) throw new Error('vision chat failed and fallback failed');
+          setMessages((s) => [...s, { from: 'bot', text: r2.data?.reply || 'No reply' }]);
+          return;
         }
-        try {
-          const j = JSON.parse(textResp || '{}');
-          const reply = (j && (j.diagnosis || j.crop || j.reply)) ? formatVisionResponse(j) : (j.reply || textResp || 'No reply');
-          setMessages((s) => [...s, { from: 'bot', text: reply }]);
-        } catch (e) {
-          setMessages((s) => [...s, { from: 'bot', text: textResp || 'No reply' }]);
-        }
+        const j = res.data as any;
+        const reply = (j && (j.diagnosis || j.crop || j.reply)) ? formatVisionResponse(j) : (j?.reply || 'No reply');
+        setMessages((s) => [...s, { from: 'bot', text: reply }]);
       } else {
-        const res = await fetch(`${base}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: m }) });
-        if (!res.ok) throw new Error('chat failed');
-        const j = await res.json();
-        setMessages((s) => [...s, { from: 'bot', text: j.reply }]);
+        const { chat } = await import('@/lib/api');
+        const r = await chat(m, 'en');
+        if (r.error) throw new Error(r.error);
+        setMessages((s) => [...s, { from: 'bot', text: r.data?.reply || 'No reply' }]);
       }
     } catch (e) {
       setServiceWarning('Chat service unavailable.');

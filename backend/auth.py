@@ -12,6 +12,15 @@ BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "data.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "please_change_this_secret")
 JWT_ALG = "HS256"
+ADMIN_USERNAMES = set(os.getenv("ADMIN_USERNAMES", "admin").split(","))
+
+# Validate JWT_SECRET at startup
+if JWT_SECRET == "please_change_this_secret":
+    raise RuntimeError(
+        "JWT_SECRET must be set to a secure value via environment variable. "
+        "The default placeholder 'please_change_this_secret' is not allowed in production. "
+        "Generate a secure secret with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+    )
 
 
 def _get_conn():
@@ -31,6 +40,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             region TEXT,
+            is_admin INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         )
         """
@@ -72,10 +82,11 @@ def create_user(username: str, password: str, region: Optional[str] = None) -> D
     conn = _get_conn()
     cur = conn.cursor()
     now = datetime.utcnow().isoformat()
+    is_admin = 1 if username in ADMIN_USERNAMES else 0
     try:
         cur.execute(
-            "INSERT INTO users (username, password_hash, salt, region, created_at) VALUES (?, ?, ?, ?, ?)",
-            (username, parts["hash"], parts["salt"], region, now),
+            "INSERT INTO users (username, password_hash, salt, region, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, parts["hash"], parts["salt"], region, is_admin, now),
         )
         conn.commit()
         user_id = cur.lastrowid
@@ -83,7 +94,7 @@ def create_user(username: str, password: str, region: Optional[str] = None) -> D
         conn.close()
         raise ValueError("username_taken")
     conn.close()
-    return {"id": user_id, "username": username, "region": region}
+    return {"id": user_id, "username": username, "region": region, "is_admin": bool(is_admin)}
 
 
 def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
@@ -97,7 +108,8 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
         return None
     if not _verify_password(password, row["salt"], row["password_hash"]):
         return None
-    return {"id": row["id"], "username": row["username"], "region": row["region"]}
+    is_admin = row["is_admin"] if "is_admin" in row.keys() else (1 if username in ADMIN_USERNAMES else 0)
+    return {"id": row["id"], "username": row["username"], "region": row["region"], "is_admin": bool(is_admin)}
 
 
 def create_access_token(user: Dict[str, Any], expires_days: int = 7) -> str:
@@ -116,6 +128,53 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
         return data
     except Exception:
         return None
+
+
+def verify_token(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Verify JWT token from Authorization header and return user dict with is_admin flag.
+    
+    Args:
+        authorization: Authorization header value (e.g., "Bearer <token>")
+    
+    Returns:
+        Dict with user info including is_admin flag, or None if token invalid/absent
+    """
+    if not authorization:
+        return None
+    
+    # Strip Bearer prefix
+    token = authorization
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]
+    elif authorization.startswith("bearer "):
+        token = authorization[7:]
+    
+    # Decode token
+    data = decode_access_token(token)
+    if not data:
+        return None
+    
+    # Get user from database to fetch is_admin flag
+    user_id = data.get("sub")
+    if not user_id:
+        return None
+    
+    user = get_user_by_id(user_id)
+    if not user:
+        return None
+    
+    # Add is_admin flag based on DB or username fallback
+    username = user.get("username", "")
+    is_admin = user.get("is_admin", False)
+    if not is_admin and username in ADMIN_USERNAMES:
+        is_admin = True
+    
+    return {
+        "id": user_id,
+        "username": username,
+        "region": user.get("region"),
+        "is_admin": bool(is_admin)
+    }
 
 
 def save_diagnosis(user_id: int, diagnosis_json: str, crop: Optional[str] = None, location: Optional[str] = None) -> Dict[str, Any]:
@@ -156,9 +215,16 @@ def get_user_by_id(user_id: int):
     init_db()
     conn = _get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, username, region, created_at FROM users WHERE id = ?", (user_id,))
+    cur.execute("SELECT id, username, region, is_admin, created_at FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         return None
-    return {"id": row["id"], "username": row["username"], "region": row["region"], "created_at": row["created_at"]}
+    is_admin = row["is_admin"] if "is_admin" in row.keys() else (1 if row["username"] in ADMIN_USERNAMES else 0)
+    return {
+        "id": row["id"], 
+        "username": row["username"], 
+        "region": row["region"], 
+        "is_admin": bool(is_admin),
+        "created_at": row["created_at"]
+    }

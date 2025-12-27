@@ -48,7 +48,10 @@ export async function demoPushPullSync(db: any, userId: string) {
   const base = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '') || `${location.protocol}//${location.hostname}:${location.port}`;
   for (const doc of all) {
     try {
-      await fetch(`${base}/api/diagnosis_history`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc.toJSON()) })
+      const { saveDiagnosis } = await import('@/lib/api')
+      const res = await saveDiagnosis(doc.toJSON())
+      // ignore result; failures will be surfaced by central client via events
+      void res
     } catch (e) {
       // ignore network errors
     }
@@ -56,10 +59,13 @@ export async function demoPushPullSync(db: any, userId: string) {
 
   // Pull remote history and upsert
   try {
-    const r = await fetch(`${base}/api/diagnosis_history`)
-    if (r.ok) {
-      const body = await r.json()
-      const remote = body.history || []
+    const { listDiagnosis } = await import('@/lib/api')
+    const r = await listDiagnosis()
+    const remote = r.data?.history || []
+    if (r.error) {
+      // if error, treat as no-op
+    }
+    if (remote && Array.isArray(remote)) {
       for (const item of remote) {
         try {
           await col.upsert({ id: item.id || item._id || String(Math.random()), user: userId, createdAt: item.createdAt || new Date().toISOString(), payload: item })

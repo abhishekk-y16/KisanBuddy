@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useRouter } from 'next/router';
-import { getApiUrl } from '@/lib/api';
+import { getApiUrl, saveDiagnosis } from '@/lib/api';
 import { Modal } from './Modal';
 import ResultHeaderCard from './ui/ResultHeaderCard';
 import { Button, Alert, Card } from './ui';
@@ -22,6 +22,7 @@ interface DiagnosisResult {
   severity?: 'low' | 'medium' | 'high';
   affected_parts?: string[];
   estimated_yield_loss_pct?: { min: number; max: number };
+  provider?: string;
 }
 
 interface DiagnosticModalProps {
@@ -36,12 +37,16 @@ function isTreatmentDetails(t: any): t is TreatmentDetails {
 export function DiagnosticModal({ onClose, inline = false }: DiagnosticModalProps) {
   const [image, setImage] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [selectedCrop, setSelectedCrop] = useState<string | null>(null);
   const [result, setResult] = useState<DiagnosisResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [serviceWarning, setServiceWarning] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const router = useRouter();
+  const apiBase = getApiUrl();
 
   const handleCapture = () => fileRef.current?.click();
 
@@ -72,45 +77,39 @@ export function DiagnosticModal({ onClose, inline = false }: DiagnosticModalProp
 
       try {
         setLoading(true);
-        // try upload
+        // try upload via central formPost (gives timeouts/retries and error events)
         const blob = await (await fetch(dataUrl)).blob();
         const form = new FormData();
         form.append('file', blob, 'upload.jpg');
-        const res = await fetch(`${getApiUrl()}/api/upload_image`, { method: 'POST', body: form });
-        if (res.ok) {
-          const j = await res.json();
-          // `upload_image` returns a relative path like `/static/tmp_uploads/xxx`.
-          // Store a full URL so the browser can fetch the preview from the backend host.
-          const full = `${getApiUrl().replace(/\/$/, '')}${j.url}`;
-          setImageUrl(full);
+        const { formPost, visionDiagnostic } = await import('@/lib/api');
+        const up = await formPost<any>('/api/upload_image', form);
+        if (up.error) {
+          throw new Error(up.error);
         }
+        const j = up.data;
+        const full = `${apiBase.replace(/\/$/, '')}${j.url}`;
+        setImageUrl(full);
 
-        // call diagnostic endpoint
+        // call diagnostic endpoint via central client
         const payload: any = {};
-        if (imageUrl) payload.image_url = imageUrl; else payload.image_base64 = dataUrl.split(',')[1];
-        const r = await fetch(`${getApiUrl()}/api/vision_diagnostic`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (r.ok) {
-          const j = await r.json();
-          setResult(j as DiagnosisResult);
-        } else {
-          // try to extract server error message (may be text or json)
-          let msg = 'AI service temporarily unavailable.';
-          try {
-            const j = await r.json();
-            msg = j?.detail || JSON.stringify(j);
-          } catch (e) {
-            try {
-              msg = await r.text();
-            } catch {
-              /* ignore */
-            }
-          }
-          setServiceWarning(`${msg}`);
+        // Provide both an uploaded URL and the base64 payload so the backend
+        // can choose the most reliable source. Some environments may make
+        // the uploaded URL inaccessible to the backend fetch, so sending
+        // base64 prevents "image not accessible" fallbacks.
+        if (full) payload.image_url = full;
+        if (selectedCrop) payload.crop = selectedCrop;
+        try {
+          payload.image_base64 = dataUrl.split(',')[1];
+        } catch (e) {
+          // If splitting fails, omit base64 and rely on image_url
+        }
+        // No soil metadata attached from crop diagnostic modal
+        const diag = await visionDiagnostic(payload);
+        if (diag.error) {
+          setServiceWarning(diag.error);
           setResult(demoResult());
+        } else {
+          setResult(diag.data as DiagnosisResult);
         }
       } catch (err: any) {
         const message = err?.message || String(err) || 'Upload failed';
@@ -151,7 +150,24 @@ export function DiagnosticModal({ onClose, inline = false }: DiagnosticModalProp
 
       {!image ? (
         <div className="space-y-6">
-          <div className="max-w-xs mx-auto text-center">
+            <div className="max-w-xs mx-auto text-center">
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-neutral-700 mb-2">Select Crop</label>
+              <select value={selectedCrop ?? ''} onChange={(ev) => setSelectedCrop(ev.target.value || null)} className="w-full border rounded p-2">
+                <option value="" disabled>-- Select Crop --</option>
+                <option>Tomato</option>
+                <option>Potato</option>
+                <option>Rice</option>
+                <option>Wheat</option>
+                <option>Maize</option>
+                <option>Chillies</option>
+                <option>Okra</option>
+                <option>Eggplant</option>
+                <option>Cotton</option>
+                <option>Soybean</option>
+              </select>
+            </div>
+            
             <div className="mb-4">
               <svg className="w-12 h-12 text-neutral-400 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
@@ -173,6 +189,23 @@ export function DiagnosticModal({ onClose, inline = false }: DiagnosticModalProp
             onShare={() => {}}
           />
 
+          <div className="mt-3">
+            <label className="block text-sm font-medium text-neutral-700 mb-2">Select Crop</label>
+            <select value={selectedCrop ?? (result?.crop ?? '')} onChange={(ev) => setSelectedCrop(ev.target.value || null)} className="w-48 border rounded p-2">
+              <option value="" disabled>-- Select Crop --</option>
+              <option>Tomato</option>
+              <option>Potato</option>
+              <option>Rice</option>
+              <option>Wheat</option>
+              <option>Maize</option>
+              <option>Chillies</option>
+              <option>Okra</option>
+              <option>Eggplant</option>
+              <option>Cotton</option>
+              <option>Soybean</option>
+            </select>
+          </div>
+
           <div className="flex gap-2 mt-3">
             <Button variant="secondary" onClick={() => {
               // prepare chat prefill payload and navigate
@@ -182,6 +215,29 @@ export function DiagnosticModal({ onClose, inline = false }: DiagnosticModalProp
               try { sessionStorage.setItem('chat_prefill', JSON.stringify(payload)); } catch (e) { /* ignore */ }
               router.push('/chat');
             }}>Open in Chat</Button>
+          </div>
+
+          <div className="flex gap-2 mt-3">
+            <Button variant="secondary" onClick={async () => {
+              setSyncing(true);
+              setSyncMessage(null);
+              try {
+                // Attempt to save diagnosis to server (requires auth token)
+                const payload: any = { ...result };
+                if (imageUrl) payload.image_url = imageUrl; // include uploaded URL when available
+                const res = await saveDiagnosis(payload as any);
+                if (res && (res as any).error) {
+                  setSyncMessage('Sync failed: ' + (res as any).error);
+                } else {
+                  setSyncMessage('Synced to your history');
+                }
+              } catch (e: any) {
+                setSyncMessage('Sync failed: ' + (e?.message || String(e)));
+              } finally {
+                setSyncing(false);
+              }
+            }} disabled={syncing}>{syncing ? 'Syncing…' : 'Sync'}</Button>
+            {syncMessage && <div className="text-sm text-neutral-600">{syncMessage}</div>}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

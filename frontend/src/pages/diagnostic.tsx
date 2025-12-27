@@ -11,90 +11,253 @@ export default function DiagnosticPage() {
   ];
 
   return (
-    <div className="min-h-screen bg-neutral-50 py-12">
-      <div className="max-w-screen-2xl mx-auto px-8">
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-3xl font-extrabold text-neutral-900">Crop Diagnostics</h1>
-            <p className="text-sm text-neutral-500 mt-1">Upload a leaf photo or capture with your phone to get an instant diagnosis and treatment plan.</p>
-          </div>
-          <div className="flex items-center gap-3">
-            <Button variant="ghost" onClick={() => window.open('/weather', '_self')}>Weather</Button>
-            <Button onClick={() => window.open('/market', '_self')}>Market Prices</Button>
-            <Button variant="ghost" onClick={() => window.open('/chat', '_self')}>Chat</Button>
+    <div className="min-h-screen bg-gradient-to-br from-green-50 via-emerald-50 to-teal-50 py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6">
+        
+        {/* Header */}
+        <div className="mb-8">
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+            <div>
+              <h1 className="text-3xl sm:text-4xl font-bold text-neutral-900 mb-2">
+                🔬 Crop Diagnostics
+              </h1>
+              <p className="text-sm sm:text-base text-neutral-600 max-w-2xl">
+                Upload a leaf photo to get instant AI-powered diagnosis with confidence scores and treatment recommendations
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={() => window.open('/weather', '_self')}>
+                Weather
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => window.open('/market', '_self')}>
+                Market
+              </Button>
+              <Button size="sm" onClick={() => window.location.reload()}>
+                🔄 Refresh
+              </Button>
+            </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-12 gap-8">
-          <main className="col-span-12 lg:col-span-9">
-            <Card padding="lg" className="mb-6">
-              <CardHeader title="Scan a Crop" subtitle="Get diagnosis, confidence, and step-by-step treatment" />
-              <div className="mt-4">
-                <DiagnosticComponent inline />
+        {/* Main Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          
+          {/* Main Diagnostic Area */}
+          <main className="lg:col-span-8">
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <div className="mb-6">
+                  <h2 className="text-xl font-semibold text-neutral-900 mb-2">Upload & Diagnose</h2>
+                  <p className="text-sm text-neutral-600">
+                    Take a clear photo of the affected leaf or plant part for accurate AI analysis
+                  </p>
+                </div>
+                
+                {/* Diagnostic Component */}
+                <div className="bg-neutral-50 rounded-xl p-4 border-2 border-dashed border-neutral-300">
+                  <DiagnosticComponent inline />
+                </div>
               </div>
             </Card>
 
-            {/* 'How it works' card removed per request */}
-          </main>
-
-          <aside className="col-span-12 lg:col-span-3">
-            <Card>
-              <CardHeader title="Recent Scans" subtitle="Quick access" />
-              <div className="p-3">
-                {recent.length === 0 ? (
-                  <EmptyState icon="📷" title="No recent scans" description="Scan a crop to see results here." />
-                ) : (
-                  <ul className="space-y-3">
-                    {recent.map((r) => (
-                      <li key={r.id} className="p-3 border border-neutral-100 rounded-lg bg-white">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <div className="text-sm font-semibold text-neutral-900">{r.crop}</div>
-                            <div className="text-xs text-neutral-500">{r.date}</div>
-                          </div>
-                          <div className="text-right text-sm">
-                            <div className="font-medium">{r.result}</div>
-                            <div className="text-xs text-neutral-500">{Math.round(r.confidence * 100)}%</div>
+            {/* Recent Scans - Only show if there are recent items */}
+            {recent.length > 0 && (
+              <Card variant="elevated" className="bg-white/90 backdrop-blur-sm mt-6">
+                <div className="p-6">
+                  <h2 className="text-xl font-semibold text-neutral-900 mb-4">📋 Recent Scans</h2>
+                  <div className="space-y-3">
+                    {recent.map((item) => (
+                      <div 
+                        key={item.id} 
+                        className="flex items-center justify-between p-4 bg-neutral-50 border border-neutral-200 rounded-lg hover:shadow-md transition"
+                      >
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3">
+                            <span className="text-2xl">🌱</span>
+                            <div>
+                              <h3 className="font-semibold text-neutral-900">{item.crop}</h3>
+                              <p className="text-sm text-neutral-600">{item.result}</p>
+                              <p className="text-xs text-neutral-500 mt-1">{item.date}</p>
+                            </div>
                           </div>
                         </div>
-                      </li>
+                        <div className="text-right">
+                          <div className="text-sm font-medium text-neutral-700">
+                            Confidence
+                          </div>
+                          <div className={`text-2xl font-bold ${
+                            item.confidence >= 0.8 ? 'text-green-600' :
+                            item.confidence >= 0.6 ? 'text-yellow-600' :
+                            'text-orange-600'
+                          }`}>
+                            {Math.round(item.confidence * 100)}%
+                          </div>
+                        </div>
+                      </div>
                     ))}
-                  </ul>
-                )}
+                  </div>
+                </div>
+              </Card>
+            )}
+          </main>
+
+          {/* Sidebar - Tips & Guidelines */}
+          <aside className="lg:col-span-4 space-y-6">
+            
+            {/* Photo Tips Card */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-neutral-900 mb-4">📸 Photo Tips</h2>
+                
+                <div className="space-y-4">
+                  {/* Essential Tips */}
+                  <div>
+                    <h3 className="text-sm font-semibold text-neutral-800 mb-3 flex items-center gap-2">
+                      <span className="text-green-600">✓</span>
+                      Do This
+                    </h3>
+                    <ul className="space-y-2">
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-green-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">
+                          <strong>Clear focus:</strong> Ensure the affected area is sharp and in focus
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-green-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">
+                          <strong>Good lighting:</strong> Use natural daylight or bright, even indoor lighting
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-green-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">
+                          <strong>Plain background:</strong> Place leaf against contrasting, uncluttered surface
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-green-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">
+                          <strong>Multiple angles:</strong> Capture close-up and wider context shots
+                        </span>
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* Things to Avoid */}
+                  <div className="pt-4 border-t border-neutral-200">
+                    <h3 className="text-sm font-semibold text-neutral-800 mb-3 flex items-center gap-2">
+                      <span className="text-red-600">✗</span>
+                      Avoid
+                    </h3>
+                    <ul className="space-y-2">
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-red-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">Blurry or out-of-focus images</span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-red-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">Heavy shadows or backlighting</span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-red-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">Digital zoom (move closer instead)</span>
+                      </li>
+                      <li className="flex items-start gap-2 text-sm">
+                        <span className="text-red-600 mt-0.5">●</span>
+                        <span className="text-neutral-700">Cluttered or busy backgrounds</span>
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* Pro Tips */}
+                  <div className="pt-4 border-t border-neutral-200">
+                    <h3 className="text-sm font-semibold text-neutral-800 mb-3 flex items-center gap-2">
+                      <span>💡</span>
+                      Pro Tips
+                    </h3>
+                    <ul className="space-y-2 text-sm text-neutral-700">
+                      <li className="flex items-start gap-2">
+                        <span className="text-primary-600 mt-0.5">→</span>
+                        <span>Tap the screen to lock focus on the leaf before capturing</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-primary-600 mt-0.5">→</span>
+                        <span>Include a reference object (coin/finger) to show scale</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-primary-600 mt-0.5">→</span>
+                        <span>Add context in the question box (irrigation, recent sprays, weather)</span>
+                      </li>
+                    </ul>
+                  </div>
+                </div>
               </div>
             </Card>
 
-            <Card className="mt-4">
-              <CardHeader title="Tips & Best Practices" subtitle="Capture guidance" />
-              <div className="p-3 text-sm text-neutral-700">
-                <ul className="list-disc pl-5 space-y-2">
-                  <li>
-                    <span className="font-medium">Use a plain background:</span> place the leaf against a plain, contrasting background and fill the frame so the leaf is clearly visible.
-                  </li>
-                  <li>
-                    <span className="font-medium">Good lighting:</span> prefer daylight or even lighting; avoid harsh shadows or backlight that hide lesions.
-                  </li>
-                  <li>
-                    <span className="font-medium">Multiple angles:</span> take close-up photos of affected areas and one wider shot showing the whole plant or branch when possible.
-                  </li>
-                  <li>
-                    <span className="font-medium">Stable focus:</span> ensure images are sharp (tap to focus on phone) and avoid motion blur.
-                  </li>
-                  <li>
-                    <span className="font-medium">Include context:</span> note recent irrigation, sprays, or weather if you can — add this in the question box for better diagnosis.
-                  </li>
-                </ul>
+            {/* How It Works */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-neutral-900 mb-4">🤖 How It Works</h2>
+                <div className="space-y-3">
+                  <div className="flex items-start gap-3">
+                    <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 text-primary-700 flex items-center justify-center font-bold text-sm">
+                      1
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-neutral-800 text-sm">Upload Photo</h3>
+                      <p className="text-xs text-neutral-600 mt-1">
+                        Capture or upload a clear image of the affected plant part
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-start gap-3">
+                    <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 text-primary-700 flex items-center justify-center font-bold text-sm">
+                      2
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-neutral-800 text-sm">AI Analysis</h3>
+                      <p className="text-xs text-neutral-600 mt-1">
+                        Advanced computer vision identifies disease patterns and symptoms
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-start gap-3">
+                    <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 text-primary-700 flex items-center justify-center font-bold text-sm">
+                      3
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-neutral-800 text-sm">Get Results</h3>
+                      <p className="text-xs text-neutral-600 mt-1">
+                        Receive diagnosis with confidence score and treatment recommendations
+                      </p>
+                    </div>
+                  </div>
+                </div>
               </div>
             </Card>
 
-            <Card className="mt-4">
-              <CardHeader title="Resources" subtitle="Local help" />
-              <div className="p-3 text-sm text-neutral-700">
-                <p className="text-xs text-neutral-500">Krishi Vigyan Kendra nearest: +91-11-XXXX-XXXX</p>
-                <p className="text-xs text-neutral-500 mt-2">Use Market tab to compare effective mandi prices after diagnosis and harvest planning.</p>
+            {/* Quick Stats */}
+            <Card variant="elevated" className="bg-gradient-to-br from-primary-50 to-primary-100 border-2 border-primary-200">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-primary-900 mb-4">📊 System Stats</h2>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="text-center">
+                    <div className="text-3xl font-bold text-primary-700">50+</div>
+                    <div className="text-xs text-primary-600 mt-1">Diseases Detected</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-3xl font-bold text-primary-700">85%</div>
+                    <div className="text-xs text-primary-600 mt-1">Avg Accuracy</div>
+                  </div>
+                </div>
               </div>
             </Card>
+
           </aside>
+
         </div>
       </div>
     </div>

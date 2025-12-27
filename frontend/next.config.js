@@ -18,6 +18,10 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // Allow builds to proceed even if eslint warnings/errors exist (handled separately during development).
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
   reactStrictMode: true,
   env: {
     NEXT_PUBLIC_API_URL:

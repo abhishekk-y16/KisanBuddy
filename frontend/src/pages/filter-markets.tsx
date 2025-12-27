@@ -26,22 +26,12 @@ export default function FilterMarketsPage() {
       return
     }
 
-    const apiBase = (process.env.NEXT_PUBLIC_API_URL as string) || 'http://localhost:8080'
-    const payload = {
-      markets: lines.map(n => ({ name: n })),
-      location: { lat: parseFloat(lat), lng: parseFloat(lng) },
-      radius_km: parseFloat(radius || '100')
-    }
-
     try {
       setLoading(true)
-      const res = await fetch(`${apiBase}/api/filter_markets`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-      if (!res.ok) {
-        const txt = await res.text().catch(()=>null)
-        throw new Error(txt || 'Server error')
-      }
-      const j = await res.json()
-      setResults(j.markets || [])
+      const { filterMarkets } = await import('@/lib/api')
+      const r = await filterMarkets(lines.map(n => ({ name: n })), { lat: parseFloat(lat), lng: parseFloat(lng) }, parseFloat(radius || '100'))
+      if (r.error) throw new Error(r.error)
+      setResults(r.data?.markets || [])
     } catch (err: any) {
       setError(err.message || 'Failed')
     } finally {

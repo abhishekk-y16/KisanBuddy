@@ -3,6 +3,7 @@ from PIL import Image, ImageStat
 import io
 import httpx
 import math
+import logging
 
 
 def _avg_color_from_bytes(b: bytes) -> Optional[tuple]:
@@ -60,24 +61,24 @@ def analyze_images(images: List[bytes]) -> Dict[str, Any]:
     # dominant texture
     dominant_texture = max(textures.items(), key=lambda kv: kv[1])[0] if textures else 'unknown'
 
-    # heuristic nutrient inferences (indicative only)
+    # heuristic nutrient inferences (indicative only - NOT diagnostic)
     likely = {
-        'pH_range': 'neutral to slightly acidic',
-        'organic_carbon': 'medium',
-        'N': 'moderate',
-        'P': 'moderate',
-        'K': 'moderate',
+        'pH_range': 'neutral to slightly acidic (indicative – needs lab test)',
+        'organic_carbon': 'medium (indicative – needs lab test)',
+        'N': 'moderate (indicative – needs lab test)',
+        'P': 'moderate (indicative – needs lab test)',
+        'K': 'moderate (indicative – needs lab test)'
     }
-    # adjust heuristics
+    # adjust heuristics based on color/texture cues
     if color_desc in ('dark brown/black (organic-rich)',):
-        likely['organic_carbon'] = 'high'
-        likely['N'] = 'likely adequate'
+        likely['organic_carbon'] = 'appears high (indicative – needs lab test)'
+        likely['N'] = 'possibly adequate (indicative – needs lab test)'
     if color_desc in ('pale/bleached',):
-        likely['organic_carbon'] = 'low'
-        likely['N'] = 'likely low'
+        likely['organic_carbon'] = 'appears low (indicative – needs lab test)'
+        likely['N'] = 'possibly low (indicative – needs lab test)'
     if 'sandy' in dominant_texture or 'gritty' in dominant_texture:
-        likely['P'] = 'tends to be low (leaching)'
-        likely['K'] = 'can be low'
+        likely['P'] = 'tends to be low due to leaching (indicative – needs lab test)'
+        likely['K'] = 'may be low (indicative – needs lab test)'
 
     issues = []
     if color_desc == 'greyish':
@@ -92,7 +93,9 @@ def analyze_images(images: List[bytes]) -> Dict[str, Any]:
         'dominant_texture': dominant_texture,
         'likely': likely,
         'issues': issues,
-        'confidence': 'indicative',
+        'confidence': 'low',
+        # confidence_note removed to avoid showing lengthy warnings in UI
+        'confidence_note': ''
     }
 
 
@@ -102,7 +105,7 @@ def generate_farmer_report(analysis: Dict[str, Any], location: Optional[Dict[str
         if analysis else "Soil visual analysis unavailable."
     problems = analysis.get('issues', []) if analysis else []
 
-    # Natural, low-cost solutions (no chemicals first)
+    # Natural, low-cost solutions (no specific NPK quantities - avoid prescriptive advice without lab values)
     natural_steps = [
         'Add well-decomposed compost or farmyard manure (FYM) to build organic matter and improve structure.',
         'Grow green manures (e.g., Sesbania, Dhaincha) during fallow to fix nitrogen and add biomass.',
@@ -135,9 +138,10 @@ def generate_farmer_report(analysis: Dict[str, Any], location: Optional[Dict[str
 
     # Precautions and good practices
     precautions = [
-        'Do not apply high doses of synthetic NPK without a soil test; it can worsen imbalances.',
+        'Do not apply synthetic NPK fertilizers based on photo analysis alone - this can worsen imbalances or waste resources.',
         'Avoid puddling and waterlogging; ensure fields have drainage channels if needed.',
-        'Do not burn crop residues; use them as mulch or compost.'
+        'Do not burn crop residues; use them as mulch or compost.',
+        'Contact your nearest Krishi Vigyan Kendra (KVK) or soil testing laboratory for professional analysis.'
     ]
 
     # Nearby centers lookup using reverse geocoding to extract state/district and map to example centers
@@ -160,7 +164,8 @@ def generate_farmer_report(analysis: Dict[str, Any], location: Optional[Dict[str
         'precautions': precautions,
         'nearby_centers': nearby,
         'notes': notes or '',
-        'confidence_note': 'Image-based diagnosis is indicative; confirm with an official soil lab test.'
+        # do not include a global confidence_note/warning here; UI controls messages
+        'confidence_note': ''
     }
 
     # If no centers found but we have a location, add a helpful maps-search fallback

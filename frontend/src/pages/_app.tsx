@@ -3,6 +3,7 @@ import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
+import ApiErrorToast from '@/components/ApiErrorToast';
 
 export default function App({ Component, pageProps }: AppProps) {
   const [isOffline, setIsOffline] = useState(false);
@@ -38,6 +39,7 @@ export default function App({ Component, pageProps }: AppProps) {
           📴 ऑफलाइन मोड | Offline Mode – Data will sync when connected
         </div>
       )}
+      <ApiErrorToast />
       <Component {...pageProps} />
     </>
   );

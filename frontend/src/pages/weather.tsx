@@ -3,6 +3,7 @@ import { WeatherModal as WeatherComponent } from '@/components/WeatherModal';
 import Card, { CardHeader } from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import { Alert } from '@/components/ui/Alert';
+import { getNearbyPrices } from '@/lib/api';
 
 type Forecast = {
   day: string;
@@ -13,20 +14,23 @@ type Forecast = {
   advisory?: string;
 };
 
-function ForecastCard({ item, onSelect }: { item: Forecast; onSelect: (f: Forecast) => void }) {
+function ForecastCard({ item, onSelect, selected }: { item: Forecast; onSelect: (f: Forecast) => void; selected?: boolean }) {
   return (
     <button
       onClick={() => onSelect(item)}
       className="focus:outline-none"
       aria-label={`Select ${item.day} forecast`}
     >
-      <Card variant="elevated" padding="sm" className="w-full sm:w-44 hover:shadow-lg transition rounded-md">
-        <div className="flex items-center gap-3">
-          <div className="flex-shrink-0 text-3xl">{item.icon}</div>
-          <div className="flex-1 text-left">
-            <div className="text-sm font-semibold text-neutral-700">{item.day}</div>
-            <div className="text-xs text-neutral-500 mt-1">{item.hi}° / {item.lo}° • ☔ {item.rain}%</div>
-          </div>
+      <Card
+        variant="elevated"
+        padding="sm"
+        className={`w-full sm:w-44 transition transform hover:scale-102 ${selected ? 'ring-2 ring-primary-300 shadow-lg' : 'hover:shadow-lg'} rounded-md p-3`}
+      >
+        <div className="flex flex-col items-center text-center gap-2">
+          <div className="text-4xl leading-none">{item.icon}</div>
+          <div className="text-sm font-semibold text-neutral-700">{item.day}</div>
+          <div className="text-xs text-neutral-500 mt-1">{item.hi}° / {item.lo}°</div>
+          <div className="text-xs text-neutral-400">☔ {item.rain}%</div>
         </div>
       </Card>
     </button>
@@ -48,7 +52,14 @@ export default function WeatherPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Forecast | null>(null);
+  const [selectedIndex, setSelectedIndex] = useState<number>(0);
   const [serviceWarning, setServiceWarning] = useState<string | null>(null);
+  const [currentWeather, setCurrentWeather] = useState<{ temp?: number; feels_like?: number; humidity?: number; wind_speed?: number } | null>(null);
+  const [locationState, setLocationState] = useState<{ lat: number; lng: number } | null>(null);
+  const [nearestMandi, setNearestMandi] = useState<{ city: string; state?: string; modal_price?: number; effective_price?: number; distance_km?: number } | null>(null);
+  const [mandiLoading, setMandiLoading] = useState(false);
+  const [mandiError, setMandiError] = useState<string | null>(null);
+  const [impactAlerts, setImpactAlerts] = useState<Array<{ type: 'flood' | 'heat' | 'frost' | 'wind' | 'heavy-rain'; title: string; description: string; days: number }>>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -71,29 +82,31 @@ export default function WeatherPage() {
           });
           if (!location) {
             setServiceWarning('Geolocation not available or permission denied; using sample location.');
+          } else {
+            // persist location for other widgets (Impact Matrix / nearby mandi)
+            setLocationState(location);
           }
         } else {
           setServiceWarning('Geolocation not supported by this browser; using sample data.');
         }
 
-        const res = await fetch(`${base}/api/weather_forecast`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ location }),
-        });
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          if (res.status === 401 || text.toLowerCase().includes('unauthorized')) {
-            setServiceWarning('Weather service unauthorized (missing API key).');
-          } else if (res.status === 405) {
-            setServiceWarning('Weather API not accepting POST requests (405).');
-          }
-          throw new Error(`Status ${res.status} ${text}`);
-        }
-
-        const data = await res.json();
-        const list = data?.daily ?? data ?? [];
+            const { getWeatherForecast } = await import('@/lib/api');
+            const resp = await getWeatherForecast(location ?? undefined);
+            if (resp.error) {
+              if (resp.error.includes('401') || resp.error.toLowerCase().includes('unauthorized')) setServiceWarning('Weather service unauthorized (missing API key).');
+              if (resp.error.includes('405')) setServiceWarning('Weather API not accepting POST requests (405).');
+              throw new Error(resp.error);
+            }
+            const data = resp.data;
+            // Backend returns { forecast, advisories, farmer_report }.
+            const forecastPayload = data?.forecast ?? data ?? null;
+            const dailyList = (forecastPayload && (forecastPayload.daily || forecastPayload?.daily)) || (Array.isArray(forecastPayload) ? forecastPayload : []);
+            // current weather may be at forecastPayload.current
+            const current = forecastPayload?.current ?? null;
+            if (current && mounted) {
+              setCurrentWeather({ temp: current.temp ?? current?.temp?.day ?? null, feels_like: current.feels_like ?? null, humidity: current.humidity ?? null, wind_speed: current.wind_speed ?? null });
+            }
+            const list = dailyList;
         if (Array.isArray(list) && mounted) {
           const mapped = list.slice(0, 7).map((d: any, i: number) => ({
             day: d.day ?? d.dt_txt ?? ['Today','Tue','Wed','Thu','Fri','Sat','Sun'][i] ?? `Day ${i+1}`,
@@ -104,6 +117,10 @@ export default function WeatherPage() {
             advisory: d.advisory ?? undefined,
           }));
           setForecasts(mapped.length ? mapped : sample7);
+          
+          // Generate impact-based alerts from forecast data
+          const alerts = generateImpactAlerts(list.slice(0, 7));
+          setImpactAlerts(alerts);
         } else if (mounted) {
           setForecasts(sample7);
         }
@@ -123,158 +140,375 @@ export default function WeatherPage() {
     return () => { mounted = false; };
   }, []);
 
+  // Fetch nearest mandi prices when we have a location
+  useEffect(() => {
+    let mounted = true;
+    async function loadNearby() {
+      if (!locationState) return;
+      setMandiLoading(true);
+      setMandiError(null);
+      try {
+        const r = await getNearbyPrices('Tomato', locationState, 200, 5);
+        if (r.error) throw new Error(r.error || 'Failed to fetch nearby prices');
+        const nearby = r.data?.nearby || [];
+        if (Array.isArray(nearby) && nearby.length && mounted) {
+          const first = nearby[0];
+          setNearestMandi({ city: first.city, state: first.state, modal_price: first.modal_price, effective_price: first.effective_price, distance_km: first.distance_km });
+        }
+      } catch (err: any) {
+        if (!mounted) return;
+        setMandiError(err?.message || 'Could not fetch nearby mandi prices');
+      } finally {
+        if (mounted) setMandiLoading(false);
+      }
+    }
+    loadNearby();
+    return () => { mounted = false; };
+  }, [locationState]);
+
+  // Generate impact-based alerts from forecast data
+  function generateImpactAlerts(dailyData: any[]) {
+    const alerts: Array<{ type: 'flood' | 'heat' | 'frost' | 'wind' | 'heavy-rain'; title: string; description: string; days: number }> = [];
+    
+    // Check for heavy rain / flood risk (next 48h)
+    const next2Days = dailyData.slice(0, 2);
+    const totalRain48h = next2Days.reduce((sum, d) => sum + (d.rain ?? 0), 0);
+    const highRainDays = dailyData.filter(d => {
+      const rainMm = d.rain ?? 0;
+      const rainPercent = d.pop ?? 0;
+      return rainMm > 30 || rainPercent > 70;
+    }).length;
+    
+    if (totalRain48h > 50 || highRainDays >= 2) {
+      alerts.push({
+        type: 'flood',
+        title: 'Flood Watch — 48h',
+        description: 'Localized water logging expected — secure stored seed and check drainage.',
+        days: 2
+      });
+    } else if (highRainDays >= 1) {
+      alerts.push({
+        type: 'heavy-rain',
+        title: `Heavy Rain Alert — ${highRainDays} day${highRainDays > 1 ? 's' : ''}`,
+        description: 'Significant rainfall expected — delay fertilizer application and secure seedlings.',
+        days: highRainDays
+      });
+    }
+    
+    // Check for heat stress (next 3 days)
+    const next3Days = dailyData.slice(0, 3);
+    const heatDays = next3Days.filter(d => {
+      const maxTemp = d.temp?.max ?? d.hi ?? 0;
+      return maxTemp >= 38;
+    });
+    
+    if (heatDays.length >= 2) {
+      alerts.push({
+        type: 'heat',
+        title: `Heat Alert — ${heatDays.length} days`,
+        description: 'High temperatures forecasted — increase irrigation and provide shade for seedlings.',
+        days: heatDays.length
+      });
+    }
+    
+    // Check for frost risk
+    const frostDays = dailyData.filter(d => {
+      const minTemp = d.temp?.min ?? d.lo ?? 20;
+      return minTemp <= 5;
+    });
+    
+    if (frostDays.length > 0) {
+      alerts.push({
+        type: 'frost',
+        title: `Frost Warning — ${frostDays.length} day${frostDays.length > 1 ? 's' : ''}`,
+        description: 'Low night temperatures expected — protect sensitive crops from frost damage.',
+        days: frostDays.length
+      });
+    }
+    
+    // Check for high winds
+    const windyDays = dailyData.filter(d => {
+      const windSpeed = d.wind_speed ?? 0;
+      return windSpeed > 25; // > 25 km/h
+    });
+    
+    if (windyDays.length >= 2) {
+      alerts.push({
+        type: 'wind',
+        title: `Wind Alert — ${windyDays.length} days`,
+        description: 'Strong winds expected — secure support structures and greenhouse panels.',
+        days: windyDays.length
+      });
+    }
+    
+    return alerts;
+  }
+
+  // Utility: derive quick tips and checklist from forecasts
+  function deriveTips(from: Forecast[]) {
+    const tips: string[] = [];
+    const checklist: string[] = [];
+    const soon = from.slice(0, 3);
+    const maxRain = Math.max(...soon.map((d) => d.rain || 0));
+    if (maxRain >= 70) {
+      tips.push('Monitor soil moisture sensors after heavy rain.');
+      checklist.push('Check drainage channels after heavy rain.');
+    } else if (maxRain >= 30) {
+      tips.push('Delay spray operations during active precipitation windows.');
+      checklist.push('Record crop stage for advisory accuracy.');
+    } else {
+      tips.push('Conditions look stable — plan field operations on dry windows.');
+    }
+    if (from.some((d) => (d.advisory || '').toLowerCase().includes('wind') || (d.advisory || '').toLowerCase().includes('gust'))) {
+      tips.push('Use rope supports for high-value fruiting plants before forecasted gusts.');
+      checklist.push('Secure coverings before predicted gusts.');
+    }
+    return { tips, checklist };
+  }
+
   return (
-    <div className="min-h-screen bg-surface-50 py-10">
-      <div className="max-w-7xl mx-auto px-6">
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6 gap-4">
+    <div className="min-h-screen bg-gradient-to-br from-sky-50 via-blue-50 to-indigo-50 py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6">
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between mb-8 gap-4">
           <div>
-            <h1 className="text-2xl md:text-3xl lg:text-4xl font-extrabold text-neutral-900">Weather & Impact Forecast</h1>
-            <p className="text-sm md:text-base text-neutral-500 mt-1 max-w-xl">Impact-Based Weather (IBF) tailored to your crops, crop stage and local risks — tactical guidance for the next 7–14 days.</p>
+            <h1 className="text-3xl sm:text-4xl font-bold text-neutral-900 mb-2">
+              🌤️ Weather & Impact Forecast
+            </h1>
+            <p className="text-sm sm:text-base text-neutral-600 max-w-2xl">
+              Impact-Based Weather (IBF) tailored to your location — tactical guidance for the next 7 days
+            </p>
           </div>
-          <div className="flex items-center gap-3">
-            <Button variant="ghost" onClick={() => window.open('/diagnostic', '_self')}>Diagnostics</Button>
-            <Button onClick={() => window.location.reload()}>Refresh</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => window.open('/diagnostic', '_self')}>
+              Diagnostics
+            </Button>
+            <Button size="sm" onClick={() => window.location.reload()}>
+              🔄 Refresh
+            </Button>
           </div>
         </div>
 
-        {serviceWarning && <Alert variant="warning" title="Service" className="mb-4">{serviceWarning}</Alert>}
+        {serviceWarning && (
+          <Alert variant="warning" title="Service Notice" className="mb-6">
+            {serviceWarning}
+          </Alert>
+        )}
 
-        <div className="grid grid-cols-12 gap-6">
-          <main className="col-span-12 lg:col-span-8">
-            <Card variant="glass" padding="lg">
-              <CardHeader title="Local Weather Snapshot" subtitle="Tap a day for micro-advisories" />
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <div className="lg:col-span-2">
-                  <div className="mb-4">
-                    <WeatherComponent inline />
-                  </div>
-                  <div className="rounded-md bg-white/40 p-3">
-                    <div className="flex items-center justify-between">
-                      <h4 className="text-sm font-semibold text-neutral-700">7-Day Forecast</h4>
-                      <div className="text-xs text-neutral-500">{loading ? 'Updating…' : error ? 'Using sample data' : 'Live'}</div>
+        {/* Main Layout - 3 Column Grid on Large Screens */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          
+          {/* Left Sidebar - Alerts & Current Weather */}
+          <aside className="lg:col-span-4 space-y-6">
+            
+            {/* Current Weather Card */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-neutral-800 mb-4">Current Conditions</h2>
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <div className="text-5xl font-bold text-neutral-900">
+                      {currentWeather?.temp ?? forecasts[0]?.hi}°
                     </div>
-                    {error && <div className="text-sm text-red-600 mt-2">{error}</div>}
-                    <div className="mt-3">
-                      <div className="flex gap-3 overflow-x-auto py-1">
-                        {forecasts.slice(0,7).map((s, i) => (
-                          <div key={i} className="min-w-[10rem]">
-                            <ForecastCard item={s} onSelect={(f) => setSelected(f)} />
+                    <div className="text-sm text-neutral-500 mt-1">
+                      Feels like {currentWeather?.feels_like ?? currentWeather?.temp ?? forecasts[0]?.hi}°
+                    </div>
+                  </div>
+                  <div className="text-6xl">
+                    {forecasts[0]?.icon ?? '🌤️'}
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-2 gap-4 pt-4 border-t border-neutral-200">
+                  <div>
+                    <div className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Humidity</div>
+                    <div className="text-lg font-semibold text-neutral-800">
+                      {currentWeather?.humidity ?? '--'}%
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Wind Speed</div>
+                    <div className="text-lg font-semibold text-neutral-800">
+                      {currentWeather?.wind_speed?.toFixed(1) ?? '--'} km/h
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Rain Chance</div>
+                    <div className="text-lg font-semibold text-neutral-800">
+                      {forecasts[0]?.rain ?? 0}%
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-neutral-500 uppercase tracking-wide mb-1">Status</div>
+                    <div className="text-sm font-medium text-green-600">
+                      {loading ? 'Updating...' : 'Live'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            {/* Alerts Card */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-neutral-800 mb-4">⚠️ Active Alerts</h2>
+                <div className="space-y-3">
+                  {impactAlerts.length > 0 ? (
+                    impactAlerts.map((alert, idx) => {
+                      const bgColor = alert.type === 'heat' ? 'bg-red-50 border-red-200' :
+                                     alert.type === 'flood' || alert.type === 'heavy-rain' ? 'bg-amber-50 border-amber-200' :
+                                     alert.type === 'frost' ? 'bg-blue-50 border-blue-200' :
+                                     'bg-orange-50 border-orange-200';
+                      const icon = alert.type === 'heat' ? '🌡️' :
+                                  alert.type === 'flood' || alert.type === 'heavy-rain' ? '🌊' :
+                                  alert.type === 'frost' ? '❄️' : '💨';
+                      return (
+                        <div key={idx} className={`${bgColor} border-2 p-4 rounded-lg shadow-sm`}>
+                          <div className="flex items-start gap-3">
+                            <span className="text-2xl">{icon}</span>
+                            <div className="flex-1">
+                              <div className="font-semibold text-neutral-900 mb-1">{alert.title}</div>
+                              <div className="text-xs text-neutral-600">{alert.description}</div>
+                            </div>
                           </div>
-                        ))}
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="bg-green-50 border-2 border-green-200 p-4 rounded-lg shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <span className="text-2xl">✅</span>
+                        <div>
+                          <div className="font-semibold text-green-900 mb-1">No Active Warnings</div>
+                          <div className="text-xs text-green-700">Weather conditions are favorable for normal farm operations.</div>
+                        </div>
                       </div>
                     </div>
-                  </div>
-
-                  {selected && (
-                    <Card className="mt-4">
-                      <CardHeader title={`Advisory — ${selected.day}`} subtitle={`${selected.hi}° / ${selected.lo}° • ☔ ${selected.rain}%`} />
-                      <div className="p-3 text-sm text-neutral-700">
-                        <p>{selected.advisory ?? 'No specific advisory — monitor conditions and follow IBF guidelines.'}</p>
-                      </div>
-                    </Card>
                   )}
                 </div>
-                <div className="lg:col-span-1">
-                  <div className="space-y-4">
-                    <Card>
-                      <CardHeader title="Key Metrics" subtitle="Quick glance" />
-                      <div className="p-3 text-sm text-neutral-700 space-y-2">
-                        <div className="flex items-center justify-between">
-                          <div className="text-xs text-neutral-500">Temp (now)</div>
-                          <div className="font-semibold">{forecasts[0]?.hi}°</div>
-                        </div>
-                        <div className="flex items-center justify-between">
-                          <div className="text-xs text-neutral-500">Precip. Chance</div>
-                          <div className="font-semibold">{forecasts[0]?.rain}%</div>
-                        </div>
-                        <div className="flex items-center justify-between">
-                          <div className="text-xs text-neutral-500">Advisory</div>
-                          <div className="text-sm text-neutral-600">{selected ? 'Selected day' : 'Tap a day'}</div>
-                        </div>
-                      </div>
-                    </Card>
-
-                    <Card>
-                      <CardHeader title="Micro-Advisory" subtitle="Tomato — Vegetative" />
-                      <div className="p-3 text-sm text-neutral-700">
-                        <ul className="list-disc pl-5 space-y-2">
-                          <li>High winds + water logging predicted on Thu — secure support for vines.</li>
-                          <li>Delay fertilizer application if rain &gt; 20mm expected within 24h.</li>
-                          <li>Consider mulching if heavy rain forecast to reduce seed displacement.</li>
-                        </ul>
-                      </div>
-                    </Card>
-                  </div>
+                
+                <div className="mt-6 pt-4 border-t border-neutral-200">
+                  <h3 className="text-sm font-semibold text-neutral-700 mb-2">Why this matters</h3>
+                  <p className="text-xs text-neutral-600 leading-relaxed">
+                    Impact-Based Forecasting (IBF) maps weather hazards to crop stage, providing tactical guidance 
+                    like suspending fertilizer when rain exceeds 30mm during sowing.
+                  </p>
                 </div>
-              </div>
-            </Card>
-
-            <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-              <Card>
-                <CardHeader title="Impact Matrix" subtitle="Nominal vs Effective Prices" />
-                <div className="p-3 text-sm text-neutral-700">
-                  <p className="text-xs text-neutral-500 mb-2">Distance-adjusted mandi choices help avoid transport losses.</p>
-                  <div className="flex items-center gap-3">
-                    <div className="text-sm">
-                      <div className="text-neutral-500 text-xs">Nearest Mandi</div>
-                      <div className="font-semibold">Amritsar</div>
-                      <div className="text-xs text-neutral-400">Modal: ₹2,200 / Effective: ₹2,140</div>
-                    </div>
-                  </div>
-                </div>
-              </Card>
-
-              <Card>
-                <CardHeader title="Quick Tips" subtitle="What to do now" />
-                <div className="p-3 text-sm text-neutral-700">
-                  <ol className="list-decimal pl-5 space-y-2">
-                    <li>Monitor soil moisture sensors after heavy rain.</li>
-                    <li>Delay spray operations during active precipitation windows.</li>
-                    <li>Use rope supports for high-value fruiting plants before forecasted gusts.</li>
-                  </ol>
-                </div>
-              </Card>
-
-              <Card>
-                <CardHeader title="Field Checklist" subtitle="Pre/post event" />
-                <div className="p-3 text-sm text-neutral-700">
-                  <ul className="space-y-2">
-                    <li className="text-xs">Check drainage channels after heavy rain.</li>
-                    <li className="text-xs">Secure coverings before predicted gusts.</li>
-                    <li className="text-xs">Record crop stage for advisory accuracy.</li>
-                  </ul>
-                </div>
-              </Card>
-            </div>
-          </main>
-
-          <aside className="col-span-12 lg:col-span-4">
-            <Card>
-              <CardHeader title="Alerts & Advisories" subtitle="Impact-Based Warnings" />
-              <div className="p-3 text-sm text-neutral-700 space-y-3">
-                <div className="bg-amber-50 border border-amber-100 p-3 rounded">
-                  <div className="font-semibold">Flood Watch — 48h</div>
-                  <div className="text-xs text-neutral-500">Localized river rise expected — secure stored seed.</div>
-                </div>
-                <div className="bg-red-50 border border-red-100 p-3 rounded">
-                  <div className="font-semibold">Heat Alert — 3 days</div>
-                  <div className="text-xs text-neutral-500">Shade and extra irrigation recommended for seedlings.</div>
-                </div>
-                <div>
-                  <h5 className="text-sm font-semibold mt-2">Why this matters</h5>
-                  <p className="text-xs text-neutral-500">IBF maps weather hazards to crop stage to provide tactical guidance (e.g., suspend fertilizer when rain &gt; 30mm during sowing).</p>
-                </div>
-              </div>
-            </Card>
-
-            <Card className="mt-4">
-              <CardHeader title="Local Resources" subtitle="Contacts & Help" />
-              <div className="p-3 text-sm text-neutral-700">
-                <p className="text-xs text-neutral-500">Krishi Vigyan Kendra: +91-11-XXXX-XXXX</p>
-                <p className="text-xs text-neutral-500 mt-2">Nearest mandi updates and transport tips are shown in Market tab.</p>
               </div>
             </Card>
           </aside>
+
+          {/* Center - 7-Day Forecast */}
+          <main className="lg:col-span-8 space-y-6">
+            
+            {/* 7-Day Forecast */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <h2 className="text-xl font-semibold text-neutral-900">7-Day Forecast</h2>
+                    <p className="text-sm text-neutral-500 mt-1">Tap any day for detailed advisory</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs px-2 py-1 rounded-full bg-neutral-100 text-neutral-600">
+                      {loading ? 'Updating…' : error ? 'Sample Data' : '✓ Live Data'}
+                    </span>
+                    {selected && (
+                      <Button variant="ghost" size="sm" onClick={() => { setSelected(null); setSelectedIndex(0); }}>
+                        Clear
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {error && (
+                  <Alert variant="error" className="mb-4">
+                    {error}
+                  </Alert>
+                )}
+
+                {/* Forecast Cards */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-3">
+                  {forecasts.slice(0, 7).map((forecast, i) => (
+                    <button
+                      key={i}
+                      onClick={() => { setSelected(forecast); setSelectedIndex(i); }}
+                      className={`focus:outline-none transition-all ${
+                        i === selectedIndex 
+                          ? 'transform scale-105' 
+                          : 'hover:transform hover:scale-102'
+                      }`}
+                    >
+                      <div className={`rounded-xl p-4 text-center transition-all ${
+                        i === selectedIndex
+                          ? 'bg-gradient-to-br from-primary-500 to-primary-600 text-white shadow-lg ring-2 ring-primary-300'
+                          : 'bg-white border-2 border-neutral-200 hover:border-primary-300 hover:shadow-md'
+                      }`}>
+                        <div className="text-xs font-medium mb-2 opacity-90">
+                          {forecast.day}
+                        </div>
+                        <div className="text-4xl mb-2">{forecast.icon}</div>
+                        <div className="text-lg font-bold mb-1">
+                          {forecast.hi}°
+                        </div>
+                        <div className={`text-xs mb-2 ${i === selectedIndex ? 'opacity-80' : 'text-neutral-500'}`}>
+                          {forecast.lo}°
+                        </div>
+                        <div className={`text-xs flex items-center justify-center gap-1 ${
+                          i === selectedIndex ? 'opacity-90' : 'text-neutral-600'
+                        }`}>
+                          <span>💧</span>
+                          <span>{forecast.rain}%</span>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </Card>
+
+            {/* Selected Day Advisory */}
+            {selected && (
+              <Card variant="elevated" className="bg-gradient-to-br from-primary-50 to-primary-100 border-2 border-primary-200">
+                <div className="p-6">
+                  <div className="flex items-start justify-between mb-4">
+                    <div>
+                      <h3 className="text-xl font-semibold text-primary-900 mb-1">
+                        {selected.day} Advisory
+                      </h3>
+                      <div className="flex items-center gap-4 text-sm text-primary-700">
+                        <span className="flex items-center gap-1">
+                          🌡️ {selected.hi}° / {selected.lo}°
+                        </span>
+                        <span className="flex items-center gap-1">
+                          💧 {selected.rain}% Rain
+                        </span>
+                      </div>
+                    </div>
+                    <span className="text-5xl">{selected.icon}</span>
+                  </div>
+                  
+                  <div className="bg-white/70 rounded-lg p-4 border border-primary-200">
+                    <p className="text-sm text-neutral-800 leading-relaxed">
+                      {selected.advisory ?? 'No specific advisory — monitor conditions and follow IBF guidelines for your crop stage.'}
+                    </p>
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            {/* Weather Widget */}
+            <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
+              <div className="p-6">
+                <h2 className="text-lg font-semibold text-neutral-900 mb-4">Detailed Weather View</h2>
+                <div className="rounded-lg overflow-hidden border border-neutral-200">
+                  <WeatherComponent inline />
+                </div>
+              </div>
+            </Card>
+
+          </main>
+
         </div>
       </div>
     </div>

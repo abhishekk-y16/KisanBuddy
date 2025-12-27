@@ -1,4 +1,5 @@
 import React from 'react'
+import { cleanString, cleanLikely } from '@/lib/cleanFallbacks';
 
 type Report = {
   color_description?: string
@@ -9,7 +10,7 @@ type Report = {
 }
 
 export default function StructuredReport({ report }: { report: Report }) {
-  const likely = report.likely || {}
+  const likely = cleanLikely(report.likely || {})
 
   return (
     <section className="bg-white p-4 rounded shadow-sm">
@@ -18,12 +19,12 @@ export default function StructuredReport({ report }: { report: Report }) {
       <div className="mt-3 grid gap-3">
         <div className="flex items-start gap-4">
           <div className="w-36 text-sm text-neutral-600">Color</div>
-          <div className="text-neutral-800">{report.color_description || '—'}</div>
+          <div className="text-neutral-800">{cleanString(report.color_description) || '—'}</div>
         </div>
 
         <div className="flex items-start gap-4">
           <div className="w-36 text-sm text-neutral-600">Texture</div>
-          <div className="text-neutral-800">{report.dominant_texture || '—'}</div>
+          <div className="text-neutral-800">{cleanString(report.dominant_texture) || '—'}</div>
         </div>
 
         <div className="flex items-start gap-4">

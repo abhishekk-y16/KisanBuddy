@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Modal } from './Modal';
 import { Button, Badge, Skeleton, Alert, Card } from './ui';
 
@@ -24,6 +24,7 @@ interface MarketData {
 interface MarketModalProps {
   onClose?: () => void;
   inline?: boolean;
+  defaultCrop?: string;
 }
 
 const COMMON_CROPS = [
@@ -35,7 +36,7 @@ const COMMON_CROPS = [
   { name: 'Cotton', hindi: 'कपास', icon: '☁️', color: 'bg-sky-50 hover:bg-sky-100 border-sky-200' },
 ];
 
-export function MarketModal({ onClose, inline = false }: MarketModalProps) {
+export function MarketModal({ onClose, inline = false, defaultCrop }: MarketModalProps) {
   const [selectedCrop, setSelectedCrop] = useState<typeof COMMON_CROPS[0] | null>(null);
   const [prices, setPrices] = useState<MarketData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -45,38 +46,61 @@ export function MarketModal({ onClose, inline = false }: MarketModalProps) {
     setSelectedCrop(crop);
     setLoading(true);
     setError(null);
-    
+    // debug: log start
+    // eslint-disable-next-line no-console
+    console.debug('[MarketModal] fetchPrices start for', crop?.name);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/agmarknet_proactive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ commodity: crop.name }),
-      });
-
-      if (!res.ok) {
-        // Try to read server error message
-        let text = await res.text().catch(() => null);
-        try {
-          const json = text ? JSON.parse(text) : null;
-          const detail = json?.detail || json?.message || text;
-          console.error('Server error fetching prices:', detail);
-          setError(detail || 'Could not fetch prices. Please try again.');
-        } catch {
-          console.error('Server error fetching prices:', text);
-          setError(text || 'Could not fetch prices. Please try again.');
-        }
+      const { getMarketPrices } = await import('@/lib/api');
+      const res = await getMarketPrices(crop.name);
+      // debug: log raw response
+      // eslint-disable-next-line no-console
+      console.debug('[MarketModal] getMarketPrices response', { error: res.error, data: res.data });
+      if (res.error) {
+        setError(typeof res.error === 'string' ? res.error : 'Server returned an error fetching prices');
+        setPrices(null);
         setLoading(false);
         return;
       }
-
-      const data = await res.json();
+      const data = res.data || null;
+      // debug: log data.prices length
+      // eslint-disable-next-line no-console
+      console.debug('[MarketModal] prices count', Array.isArray(data?.prices) ? data.prices.length : 0);
+      if (!data || !data.prices || data.prices.length === 0) {
+        setError('No market prices found for this crop. Ensure backend is configured with Agmarknet/CEDA or data.gov credentials.');
+        setPrices(null);
+        setLoading(false);
+        return;
+      }
       setPrices(data);
     } catch (err) {
-      console.error('Failed to fetch prices:', err);
-      setError('Could not fetch prices. Please try again.');
+      // Ignore abort errors (HMR / unmount / navigator cancellations)
+      const m = err as any;
+      const isAbort = m && (m.name === 'AbortError' || String(m).toLowerCase().includes('signal is aborted') || String(m).toLowerCase().includes('aborted'));
+      if (!isAbort) {
+        console.error('Failed to fetch prices:', err);
+        setError('Could not fetch prices. Please try again.');
+      }
     }
     setLoading(false);
   };
+
+  // Auto-fetch when inline + defaultCrop provided. Use effect to avoid running during render
+  // and to properly cancel the scheduled fetch on hot reload/unmount.
+  useEffect(() => {
+    if (!inline || !defaultCrop || selectedCrop || loading) return;
+    let mounted = true;
+    const found = COMMON_CROPS.find((c) => c.name.toLowerCase() === defaultCrop.toLowerCase());
+    const toUse = found ?? { name: defaultCrop, hindi: defaultCrop, icon: '🌾', color: 'bg-amber-50' };
+    // slightly longer delay to avoid racing with hot-reload
+    const timer = setTimeout(() => {
+      if (!mounted) return;
+      fetchPrices(toUse as any).catch(() => {});
+    }, 80);
+    return () => {
+      mounted = false;
+      clearTimeout(timer);
+    };
+  }, [inline, defaultCrop, selectedCrop, loading]);
 
   const getTrendIcon = (trend?: string) => {
     switch (trend) {

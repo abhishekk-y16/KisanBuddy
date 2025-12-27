@@ -29,6 +29,10 @@ def init_sync_db():
 
 
 def push_docs(docs: List[Dict[str, Any]]):
+    """Store documents in sync database.
+    Payloads are stored as JSON strings for lossless serialization.
+    """
+    import json
     init_sync_db()
     conn = _get_conn()
     cur = conn.cursor()
@@ -36,15 +40,21 @@ def push_docs(docs: List[Dict[str, Any]]):
         doc_id = d.get("id") or d.get("_id")
         payload = d
         updated = d.get("updated_at") or d.get("ts") or 0.0
+        # Store as JSON, not str(payload)
+        payload_json = json.dumps(payload, ensure_ascii=False)
         cur.execute(
             "INSERT OR REPLACE INTO sync_docs (id, payload, updated_at) VALUES (?, ?, ?)",
-            (doc_id, str(payload), float(updated)),
+            (doc_id, payload_json, float(updated)),
         )
     conn.commit()
     conn.close()
 
 
 def pull_docs(since_ts: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Retrieve documents from sync database.
+    Deserializes JSON payloads for client consumption.
+    """
+    import json
     init_sync_db()
     conn = _get_conn()
     cur = conn.cursor()
@@ -56,8 +66,12 @@ def pull_docs(since_ts: Optional[float] = None) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
         try:
-            # payload stored as str repr; in production store JSON
-            out.append({"id": r["id"], "payload": r["payload"], "updated_at": r["updated_at"]})
+            # Deserialize JSON payload
+            payload = json.loads(r["payload"])
+            out.append({"id": r["id"], "payload": payload, "updated_at": r["updated_at"]})
+        except json.JSONDecodeError:
+            # Skip malformed JSON
+            continue
         except Exception:
             continue
     conn.close()
@@ -104,7 +118,10 @@ class WebSocketHub:
             await asyncio.gather(*coros, return_exceptions=True)
 
     def persist_patch(self, msg: Dict[str, Any]):
-        # Persist the incoming document as LWW into sync_docs
+        """Persist incoming document patch as LWW into sync_docs.
+        Uses JSON serialization for lossless storage.
+        """
+        import json
         init_sync_db()
         conn = _get_conn()
         cur = conn.cursor()
@@ -112,9 +129,11 @@ class WebSocketHub:
         payload = msg.get("payload") or {}
         ts = float(msg.get("ts") or msg.get("updated_at") or __import__('time').time())
         try:
+            # Store as JSON, not str(payload)
+            payload_json = json.dumps(payload, ensure_ascii=False)
             cur.execute(
                 "INSERT OR REPLACE INTO sync_docs (id, payload, updated_at) VALUES (?, ?, ?)",
-                (doc_id, str(payload), ts),
+                (doc_id, payload_json, ts),
             )
             conn.commit()
         finally:

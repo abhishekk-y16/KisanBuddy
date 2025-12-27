@@ -233,20 +233,21 @@ async function syncRecord(
   try {
     const decrypted = await decryptData(record.data);
     const payload = JSON.parse(decrypted);
-    
-    const response = await fetch(apiEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    
-    if (response.ok) {
-      // Mark as synced
+    const { apiCall } = await import('@/lib/api');
+    // derive relative endpoint from full URL if possible
+    let endpoint = apiEndpoint;
+    try {
+      const u = new URL(apiEndpoint);
+      endpoint = u.pathname + u.search;
+    } catch (e) {
+      // keep as-is
+    }
+    const res = await apiCall(endpoint, 'POST', payload as any);
+    if (!res.error) {
       await db.put(store, { ...record, isSynced: 1 });
       return true;
     }
-    
-    throw new Error(`HTTP ${response.status}`);
+    throw new Error(res.error || 'Sync failed');
   } catch (error) {
     // Increment retry count
     const newRetryCount = record.retry_count + 1;

@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import Card from '@/components/ui/Card'
 import Button from '@/components/ui/Button'
 import { useRouter } from 'next/router'
+import { getNearbyPrices } from '@/lib/api'
 
 export default function NearbyPricesPage() {
   const router = useRouter()
@@ -39,29 +40,13 @@ export default function NearbyPricesPage() {
       setError('Please provide or allow access to location')
       return
     }
-    const apiBase = (process.env.NEXT_PUBLIC_API_URL as string) || 'http://localhost:8080'
-    const payload = {
-      commodity: commodity,
-      location: { lat: parseFloat(lat), lng: parseFloat(lng) },
-      radius_km: parseInt(radius || '100', 10),
-      top_n: 20
-    }
-
     try {
       setLoading(true)
-      const res = await fetch(`${apiBase}/api/agmarknet_nearby`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      if (!res.ok) {
-        const txt = await res.text().catch(()=>null)
-        throw new Error(txt || 'Server error')
-      }
-      const j = await res.json()
-      setResults(j.nearby || [])
+      const r = await getNearbyPrices(commodity, { lat: parseFloat(lat), lng: parseFloat(lng) }, parseInt(radius || '200', 10), 20)
+      if (r.error) throw new Error(r.error)
+      setResults(r.data?.nearby || [])
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch nearby prices')
+      setError(err?.message || 'Failed to fetch nearby prices')
     } finally {
       setLoading(false)
     }

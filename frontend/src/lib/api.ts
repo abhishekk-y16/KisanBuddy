@@ -4,31 +4,33 @@
  * Supports research-grade orchestration with XAI trace
  */
 
-// Resolve API URL with a runtime-local override for development:
-const buildApiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://kisanmitra-coge.onrender.com' || 'http://localhost:8080';
+// Default backend for local development when `NEXT_PUBLIC_API_URL` is not set
+// During development we run the backend on port 8000 (uvicorn), so prefer that.
+const DEFAULT_LOCAL_BACKEND = 'http://localhost:8000';
 
-// If running in the browser on localhost, prefer local backend (useful during dev)
+// Resolve API URL at runtime. Strategy:
+// 1. If `NEXT_PUBLIC_API_URL` was baked into the build, prefer it.
+// 2. If running in a browser on localhost/127.0.0.1, assume backend at port 8080.
+// 3. Otherwise default to the current page origin so same-origin deployments work.
 function resolveApiUrl(): string {
   try {
     if (typeof window !== 'undefined') {
+      const env = (process.env && (process.env.NEXT_PUBLIC_API_URL as string)) || '';
+      if (env) return env;
       const hostIsLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-      if (hostIsLocal) return process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
+      if (hostIsLocal) return DEFAULT_LOCAL_BACKEND;
+      return window.location.origin;
     }
   } catch (e) {
     // ignore and fall through
   }
-  return process.env.NEXT_PUBLIC_API_URL || 'https://kisanmitra-coge.onrender.com';
+  return (process.env && (process.env.NEXT_PUBLIC_API_URL as string)) || DEFAULT_LOCAL_BACKEND;
 }
 
 export const API_URL = resolveApiUrl();
 
-// Runtime getter: prefer local backend when in browser on localhost.
 export function getApiUrl(): string {
-  if (typeof window !== 'undefined') {
-    const hostIsLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-    if (hostIsLocal) return 'http://localhost:8080';
-  }
-  return process.env.NEXT_PUBLIC_API_URL || 'https://kisanmitra-coge.onrender.com';
+  return API_URL;
 }
 
 interface ApiResponse<T> {
@@ -37,35 +39,118 @@ interface ApiResponse<T> {
   offline: boolean;
 }
 
-async function apiCall<T>(
+export async function apiCall<T>(
   endpoint: string,
   method: 'GET' | 'POST' = 'POST',
   body?: any
 ): Promise<ApiResponse<T>> {
-  try {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('km_token') : null;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+  const MAX_RETRIES = 2;
+  // Increase default timeout to reduce spurious aborts during slow local dev
+  const TIMEOUT_MS = 60000; // 60s
 
-    const response = await fetch(`${API_URL}${endpoint}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    });
+  const token = typeof window !== 'undefined' ? localStorage.getItem('km_token') : null;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeout = controller
+      ? setTimeout(() => controller.abort(), TIMEOUT_MS)
+      : undefined;
+
+    try {
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller ? controller.signal : undefined,
+      });
+
+      if (timeout) clearTimeout(timeout);
+
+      if (!response.ok) {
+        let parsed: any = null;
+        try {
+          parsed = await response.clone().json();
+        } catch (e) {
+          // not JSON
+        }
+        const text = parsed ? JSON.stringify(parsed) : await response.text().catch(() => '');
+        const msg = `API ${method} ${endpoint} failed: ${response.status} ${response.statusText} ${text}`;
+        lastError = new Error(msg);
+        // Handle rate limiting (429) with retry-after/backoff
+        if (response.status === 429 && attempt < MAX_RETRIES) {
+          let waitMs = 2000 * (attempt + 1); // default 2s, then 4s
+          const ra = response.headers.get && response.headers.get('Retry-After');
+          if (ra) {
+            const raNum = Number(ra);
+            if (!isNaN(raNum)) waitMs = raNum * 1000;
+          } else if (parsed && parsed.detail) {
+            const m = String(parsed.detail).match(/Retry after\s*(\d+)\s*seconds?/i);
+            if (m) waitMs = Number(m[1]) * 1000;
+          }
+          try {
+            if (typeof window !== 'undefined' && window?.dispatchEvent) {
+              window.dispatchEvent(new CustomEvent('kisanbuddy:api-rate-limit', { detail: { endpoint, method, retryAfterMs: waitMs } }));
+            }
+          } catch (e) {}
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+
+        // Retry on 5xx
+        if (response.status >= 500 && attempt < MAX_RETRIES) continue;
+        throw lastError;
+      }
+
+      const data = await response.json().catch(() => null);
+      return { data, error: null, offline: false };
+    } catch (err) {
+      if (timeout) clearTimeout(timeout);
+      lastError = err;
+      const e: any = err;
+      // network failures / aborts -> retry
+      const isAbort = e && (e.name === 'AbortError' || e.code === 'ECONNABORTED' || String(e).toLowerCase().includes('aborted'));
+      const isNetwork = e && (e instanceof TypeError || (e.message && e.message.match(/NetworkError|Failed to fetch/i)));
+      if ((isAbort || isNetwork) && attempt < MAX_RETRIES) {
+        // small backoff
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+        continue;
+      }
+
+      // Normalize abort error message so UI can surface a friendly string
+      const message = e instanceof Error ? e.message : String(e);
+      const normalizedMessage = isAbort ? 'Request aborted (timeout or navigation).' : message;
+      // Avoid noisy behavior for aborted requests (HMR / navigations).
+      const isAbortError = e && (e.name === 'AbortError' || (e instanceof Error && String(e.message).toLowerCase().includes('aborted')) || (e && (e.code === 'ECONNABORTED' || e.code === 'ERR_CANCELED')));
+
+      // Emit a window event for UI layers to listen and show toasts, but skip for aborts
+      if (!isAbortError) {
+        try {
+          if (typeof window !== 'undefined' && window?.dispatchEvent) {
+            window.dispatchEvent(new CustomEvent('kisanbuddy:api-error', { detail: { endpoint, method, message } }));
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        // Also log to console to make debugging visible during development
+        // eslint-disable-next-line no-console
+        console.error('[apiCall] ', method, endpoint, message);
+      }
+
+      return {
+        data: null,
+        error: normalizedMessage,
+        offline: typeof navigator !== 'undefined' ? !navigator.onLine : false,
+      };
     }
-
-    const data = await response.json();
-    return { data, error: null, offline: false };
-  } catch (error) {
-    return {
-      data: null,
-      error: error instanceof Error ? error.message : 'Unknown error',
-      offline: !navigator.onLine,
-    };
   }
+
+  const finalMessage = lastError instanceof Error ? lastError.message : 'Unknown error';
+  return { data: null, error: finalMessage, offline: typeof navigator !== 'undefined' ? !navigator.onLine : false };
 }
 
 // Vision Diagnostic
@@ -79,6 +164,11 @@ export async function diagnoseCrop(imageBase64: string, crop?: string, location?
     crop,
     location,
   });
+}
+
+// Vision diagnostic accepting either base64 or image_url (preferred for uploads)
+export async function visionDiagnostic(payload: { image_base64?: string; image_url?: string; crop?: string; location?: { lat:number; lng:number } }) {
+  return apiCall<any>('/api/vision_diagnostic', 'POST', payload);
 }
 
 // Market Prices
@@ -98,6 +188,123 @@ export async function getMarketPrices(commodity: string, market?: string, state?
     market,
     state,
   });
+}
+
+// Nearby mandis by location
+export async function getNearbyPrices(
+  commodity: string,
+  location: { lat: number; lng: number },
+  radius_km = 200,
+  top_n = 20,
+  fuel_rate_per_ton_km?: number,
+  mandi_fees?: number
+) {
+  return apiCall<{
+    nearby: Array<{
+      city: string;
+      state?: string;
+      modal_price: number;
+      distance_km: number;
+      effective_price: number;
+      lat?: number;
+      lon?: number;
+    }>;
+  }>('/api/agmarknet_nearby', 'POST', {
+    commodity,
+    location,
+    radius_km,
+    top_n,
+    fuel_rate_per_ton_km,
+    mandi_fees,
+  });
+}
+
+// POST a FormData body (multipart) with the same resilience guarantees
+export async function formPost<T>(endpoint: string, form: FormData): Promise<ApiResponse<T>> {
+  const MAX_RETRIES = 2;
+  const TIMEOUT_MS = 120000; // larger for uploads (120s) to allow slow AI backends
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), TIMEOUT_MS) : undefined;
+    try {
+      const token = typeof window !== 'undefined' ? localStorage.getItem('km_token') : null;
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method: 'POST',
+        headers,
+        body: form as any,
+        signal: controller ? controller.signal : undefined,
+      });
+
+      if (timeout) clearTimeout(timeout);
+      if (!response.ok) {
+        let parsed: any = null;
+        try {
+          parsed = await response.clone().json();
+        } catch (e) {
+          // not JSON
+        }
+        const text = parsed ? JSON.stringify(parsed) : await response.text().catch(() => '');
+        const msg = `API form POST ${endpoint} failed: ${response.status} ${response.statusText} ${text}`;
+        lastError = new Error(msg);
+        // Handle rate limiting (429)
+        if (response.status === 429 && attempt < MAX_RETRIES) {
+          let waitMs = 2000 * (attempt + 1);
+          const ra = response.headers.get && response.headers.get('Retry-After');
+          if (ra) {
+            const raNum = Number(ra);
+            if (!isNaN(raNum)) waitMs = raNum * 1000;
+          } else if (parsed && parsed.detail) {
+            const m = String(parsed.detail).match(/Retry after\s*(\d+)\s*seconds?/i);
+            if (m) waitMs = Number(m[1]) * 1000;
+          }
+          try {
+            if (typeof window !== 'undefined' && window?.dispatchEvent) {
+              window.dispatchEvent(new CustomEvent('kisanbuddy:api-rate-limit', { detail: { endpoint, method: 'POST', retryAfterMs: waitMs } }));
+            }
+          } catch (e) {}
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        if (response.status >= 500 && attempt < MAX_RETRIES) continue;
+        throw lastError;
+      }
+
+      const data = await response.json().catch(() => null);
+      return { data, error: null, offline: false };
+    } catch (err) {
+      if (timeout) clearTimeout(timeout);
+      lastError = err;
+      const e: any = err;
+      const isAbort = e && (e.name === 'AbortError' || e.code === 'ECONNABORTED');
+      const isNetwork = e && (e instanceof TypeError || (e.message && e.message.match(/NetworkError|Failed to fetch/i)));
+      if ((isAbort || isNetwork) && attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        continue;
+      }
+
+      const message = e instanceof Error ? e.message : String(e);
+      const isAbortError = e && (e.name === 'AbortError' || (e instanceof Error && String(e.message).toLowerCase().includes('aborted')) || (e && (e.code === 'ECONNABORTED' || e.code === 'ERR_CANCELED')));
+
+      if (!isAbortError) {
+        try {
+          if (typeof window !== 'undefined' && window?.dispatchEvent) {
+            window.dispatchEvent(new CustomEvent('kisanbuddy:api-error', { detail: { endpoint, method: 'POST', message } }));
+          }
+        } catch (e) {}
+        // eslint-disable-next-line no-console
+        console.error('[formPost] ', endpoint, message);
+      }
+
+      return { data: null, error: message, offline: typeof navigator !== 'undefined' ? !navigator.onLine : false };
+    }
+  }
+  const finalMessage = lastError instanceof Error ? lastError.message : 'Unknown error';
+  return { data: null, error: finalMessage, offline: typeof navigator !== 'undefined' ? !navigator.onLine : false };
 }
 
 // Auth: register/login
@@ -125,6 +332,14 @@ export async function getHazards(location: { lat: number; lng: number }) {
     drought_risk: number;
     window_days: number;
   }>('/api/earth_engine_hazards', 'POST', { location });
+}
+
+export async function getWeatherForecast(location?: { lat: number; lng: number }) {
+  return apiCall<any>('/api/weather_forecast', 'POST', { location });
+}
+
+export async function filterMarkets(markets: Array<{ name: string }>, location: { lat: number; lng: number }, radius_km: number) {
+  return apiCall<{ markets: any[] }>('/api/filter_markets', 'POST', { markets, location, radius_km });
 }
 
 // Parcel Info
@@ -276,4 +491,8 @@ export interface ChatResult {
 
 export async function chat(message: string, language: string = 'en') {
   return apiCall<ChatResult>('/api/chat', 'POST', { message, language });
+}
+
+export async function visionChat(payload: { message: string; image_base64?: string; image_url?: string; language?: string }) {
+  return apiCall<ChatResult>('/api/vision_chat', 'POST', payload);
 }

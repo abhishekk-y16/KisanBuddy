@@ -1,46 +1,125 @@
 import os
 from typing import Dict, Any, Optional
 import httpx
+import logging
+from datetime import datetime, timedelta
 
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "57f85014a86a5caeb34f6e409e1eb913")
-OWM_BASE = "https://api.openweathermap.org/data/2.5/onecall"
+TOMORROW_API_KEY = os.getenv("TOMORROW_API_KEY", "")
+TOMORROW_BASE = "https://api.tomorrow.io/v4/timelines"
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_weather(location: Dict[str, float], exclude: Optional[str] = "minutely") -> Dict[str, Any]:
+    """Fetch weather data from Tomorrow.io or fall back to Open-Meteo.
+    
+    Requires TOMORROW_API_KEY environment variable for Tomorrow.io.
+    Falls back to Open-Meteo (no key required) if unavailable.
+    """
     lat = location.get("lat")
     lon = location.get("lng") or location.get("lon")
     if lat is None or lon is None:
         raise ValueError("location requires lat and lng/lon")
-    params = {
-        "lat": lat,
-        "lon": lon,
-        "exclude": exclude,
+    
+    # Prefer Tomorrow.io if configured
+    if TOMORROW_API_KEY:
+        try:
+            return fetch_weather_tomorrow(location)
+        except Exception as e:
+            logger.warning("Tomorrow.io weather fetch failed: %s, falling back to Open-Meteo", e)
+            try:
+                return fetch_weather_open_meteo(location)
+            except Exception as e2:
+                raise ValueError(f"Weather API error: {e}; fallback error: {e2}")
+    
+    # If no Tomorrow.io key, use Open-Meteo directly
+    logger.info("TOMORROW_API_KEY not configured, using Open-Meteo")
+    return fetch_weather_open_meteo(location)
+
+
+def fetch_weather_tomorrow(location: Dict[str, float], days: int = 14) -> Dict[str, Any]:
+    """Fetch weather using Tomorrow.io Timelines API and normalize to a OneCall-like structure.
+
+    This returns a dict with keys: `source`, `daily`, `current`, `raw` similar to other providers.
+    """
+    if not TOMORROW_API_KEY:
+        raise ValueError("TOMORROW_API_KEY not configured")
+
+    lat = location.get("lat")
+    lon = location.get("lng") or location.get("lon")
+    if lat is None or lon is None:
+        raise ValueError("location requires lat and lng/lon")
+
+    now = datetime.utcnow()
+    start = now.isoformat(timespec='seconds') + "Z"
+    end = (now + timedelta(days=days)).isoformat(timespec='seconds') + "Z"
+
+    body = {
+        "location": f"{lat},{lon}",
+        "fields": [
+            "temperature",
+            "windSpeed",
+            "humidity",
+            "precipitationProbability",
+            "precipitationIntensity"
+        ],
+        "timesteps": ["current", "1d"],
         "units": "metric",
-        "appid": WEATHER_API_KEY,
+        "startTime": start,
+        "endTime": end,
     }
-    try:
-        resp = httpx.get(OWM_BASE, params=params, timeout=20)
+
+    params = {"apikey": TOMORROW_API_KEY}
+
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.post(TOMORROW_BASE, params=params, json=body)
         resp.raise_for_status()
-        data = resp.json()
-        return data
-    except Exception as e:
-        # If OpenWeather returns unauthorized or any client error, fall back to Open-Meteo (no key needed)
-        msg = str(e)
-        try:
-            # httpx.HTTPStatusError has response attribute
-            if hasattr(e, 'response') and getattr(e, 'response') is not None and getattr(e.response, 'status_code', None) == 401:
-                # fall through to fallback
-                pass
-            else:
-                # Other errors (network/timeouts) also try fallback
-                pass
-        except Exception:
-            pass
-        # Attempt Open-Meteo fallback
-        try:
-            return fetch_weather_open_meteo(location)
-        except Exception as e2:
-            raise ValueError(f"Weather API error: {e}; fallback error: {e2}")
+        raw = resp.json()
+
+    # Parse timelines
+    data = raw.get("data", {})
+    timelines = data.get("timelines", [])
+    daily = []
+    current = {}
+
+    # current
+    for tl in timelines:
+        if tl.get("timestep") == "current":
+            intervals = tl.get("intervals", [])
+            if intervals:
+                vals = intervals[0].get("values", {})
+                current = {
+                    "dt": intervals[0].get("startTime"),
+                    "temp": vals.get("temperature"),
+                    "feels_like": vals.get("temperature"),
+                    "humidity": vals.get("humidity"),
+                    "wind_speed": vals.get("windSpeed", 0.0),
+                    "weather": [{"description": ""}],
+                }
+
+    # daily
+    for tl in timelines:
+        if tl.get("timestep") == "1d":
+            for interval in tl.get("intervals", [])[:days]:
+                vals = interval.get("values", {})
+                temp = vals.get("temperature")
+                pop = (vals.get("precipitationProbability") or 0) / 100.0
+                precip_int = vals.get("precipitationIntensity") or 0.0
+                # approximate daily rain as intensity * 24 hours
+                rain_mm = float(precip_int or 0.0) * 24.0
+                wind = vals.get("windSpeed", 0.0)
+                entry = {
+                    "dt": interval.get("startTime"),
+                    "temp": {"min": temp, "max": temp},
+                    "pop": pop,
+                    "wind_speed": wind,
+                    "rain": rain_mm,
+                    "weather": [{"description": ""}],
+                }
+                daily.append(entry)
+            break
+
+    return {"source": "tomorrow", "daily": daily, "current": current, "raw": raw}
 
 
 def fetch_weather_open_meteo(location: Dict[str, float], days: int = 16) -> Dict[str, Any]:
@@ -78,43 +157,72 @@ def fetch_weather_open_meteo(location: Dict[str, float], days: int = 16) -> Dict
     windmax = d.get("windspeed_10m_max", [])
 
     for i, day in enumerate(times):
+        # Safe float conversion - handle None values from API
+        min_temp = None
+        if i < len(tmin) and tmin[i] is not None:
+            min_temp = float(tmin[i])
+        
+        max_temp = None
+        if i < len(tmax) and tmax[i] is not None:
+            max_temp = float(tmax[i])
+        
+        wind_val = 0.0
+        if i < len(windmax) and windmax[i] is not None:
+            wind_val = float(windmax[i])
+        
+        rain_val = 0.0
+        if i < len(precip) and precip[i] is not None:
+            rain_val = float(precip[i])
+        
         entry = {
             "dt": day,
             "temp": {
-                "min": float(tmin[i]) if i < len(tmin) else None,
-                "max": float(tmax[i]) if i < len(tmax) else None,
+                "min": min_temp,
+                "max": max_temp,
             },
             "pop": 0.0,
-            "wind_speed": float(windmax[i]) if i < len(windmax) else 0.0,
-            "rain": float(precip[i]) if i < len(precip) else 0.0,
+            "wind_speed": wind_val,
+            "rain": rain_val,
         }
         daily.append(entry)
 
-        # Build a `current` object from hourly where possible
-        current = {}
-        try:
-            hourly = raw.get("hourly", {})
-            htime = hourly.get("time", [])
-            if htime:
-                # Use first available hourly entry as 'current'
-                cur_idx = 0
-                temp_h = hourly.get("temperature_2m", [])
-                hum_h = hourly.get("relativehumidity_2m", [])
-                wind_h = hourly.get("wind_speed_10m", []) or hourly.get("windspeed_10m", [])
-                precip_h = hourly.get("precipitation", [])
+    # Build a `current` object from hourly where possible
+    current = {}
+    try:
+        hourly = raw.get("hourly", {})
+        htime = hourly.get("time", [])
+        if htime:
+            # Use first available hourly entry as 'current'
+            cur_idx = 0
+            temp_h = hourly.get("temperature_2m", [])
+            hum_h = hourly.get("relativehumidity_2m", [])
+            wind_h = hourly.get("wind_speed_10m", []) or hourly.get("windspeed_10m", [])
+            precip_h = hourly.get("precipitation", [])
 
-                current = {
-                    "dt": htime[cur_idx],
-                    "temp": float(temp_h[cur_idx]) if cur_idx < len(temp_h) else None,
-                    "feels_like": float(temp_h[cur_idx]) if cur_idx < len(temp_h) else None,
-                    "humidity": int(hum_h[cur_idx]) if cur_idx < len(hum_h) else None,
-                    "wind_speed": float(wind_h[cur_idx]) if cur_idx < len(wind_h) else 0.0,
-                    "weather": [{"description": ""}],
-                }
-        except Exception:
-            current = {"temp": None, "feels_like": None, "humidity": None, "wind_speed": 0.0, "weather": [{"description": ""}]}
+            temp_val = None
+            if cur_idx < len(temp_h) and temp_h[cur_idx] is not None:
+                temp_val = float(temp_h[cur_idx])
+            
+            hum_val = None
+            if cur_idx < len(hum_h) and hum_h[cur_idx] is not None:
+                hum_val = int(hum_h[cur_idx])
+            
+            wind_val = 0.0
+            if cur_idx < len(wind_h) and wind_h[cur_idx] is not None:
+                wind_val = float(wind_h[cur_idx])
 
-        return {"source": "open-meteo", "daily": daily, "current": current, "raw": raw}
+            current = {
+                "dt": htime[cur_idx],
+                "temp": temp_val,
+                "feels_like": temp_val,
+                "humidity": hum_val,
+                "wind_speed": wind_val,
+                "weather": [{"description": ""}],
+            }
+    except Exception:
+        current = {"temp": None, "feels_like": None, "humidity": None, "wind_speed": 0.0, "weather": [{"description": ""}]}
+
+    return {"source": "open-meteo", "daily": daily, "current": current, "raw": raw}
 
 
 def crop_advisories(forecast: Dict[str, Any], crop: Optional[str] = None) -> Dict[str, Any]:

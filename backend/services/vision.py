@@ -8,8 +8,15 @@ import hashlib
 import os
 import json
 import httpx
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except Exception:
+    GENAI_AVAILABLE = False
 from typing import Dict, Any, Optional
 from io import BytesIO
+import concurrent.futures
+import time
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -23,13 +30,35 @@ except Exception:
     TORCH_AVAILABLE = False
 
 # API Configuration - Supports both Gemini and Groq
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_DEFAULT_MODEL = "groq/compound"
 
+# When Gemini returns rate-limit (429) errors, temporarily skip Gemini calls
+# to avoid repeated quota failures. `GEMINI_COOLDOWN_UNTIL` stores epoch seconds.
+GEMINI_COOLDOWN_UNTIL = 0.0
+
+def get_gemini_api_keys() -> list:
+    """Return a prioritized list of Gemini API keys.
+
+    Supports either GEMINI_API_KEY (single) or GEMINI_API_KEYS (comma/whitespace-separated).
+    Each token is trimmed and only the first whitespace-delimited token per line is used so
+    accidental comments do not leak into requests.
+    """
+    raw = os.getenv("GEMINI_API_KEYS", "") or os.getenv("GEMINI_API_KEY", "") or ""
+    keys: list[str] = []
+    for chunk in raw.replace(",", "\n").splitlines():
+        token = chunk.strip()
+        if not token:
+            continue
+        keys.append(token.split()[0].strip())
+    return keys
+
+
 def get_gemini_api_key() -> str:
-    """Get Gemini API key from environment."""
-    return os.getenv("GEMINI_API_KEY", "")
+    """Backward compatible: return the first configured Gemini API key."""
+    keys = get_gemini_api_keys()
+    return keys[0] if keys else ""
 
 def get_groq_api_key() -> str:
     """Get Groq API key from environment."""
@@ -50,63 +79,47 @@ SUPPORTED_LANGUAGES = {
 }
 
 DIAGNOSIS_PROMPT = """
-You are an expert plant pathologist and agricultural advisor. Analyze the provided leaf image carefully and RETURN ONLY A SINGLE VALID JSON OBJECT. The JSON MUST follow the required top-level keys below; additionally include an `extra` object with extended actionable details for advisors and advanced users. Do not output any explanatory text outside the JSON object.
+You are a senior plant pathologist and agricultural advisor. Analyze the provided leaf/plant image and RETURN ONLY ONE STRICT JSON OBJECT (parsable by json.loads()). Do NOT output any explanation, commentary, or markdown — only one JSON object.
 
-Top-level required keys (farmer-facing, concise):
-- `diagnosis`: short disease/pest name or `Unknown` (string)
-- `diagnosisHindi`: short Hindi translation if available else empty string
-- `crop`: crop name or `Unknown` (string)
-- `confidence`: float between 0.0 and 1.0 (estimate likelihood)
-- `severity`: one of `low`, `medium`, `high`
-- `isHealthy`: boolean
-- `symptoms`: array of short symptom phrases (strings)
-- `treatment`: object with keys `immediateActions`, `organicRemedies`, `futurePrevention` (each an array of short actionable steps in farmer-friendly language)
-- `warnings`: array of short warning strings (safety, regulatory notes)
+Hard requirements:
+- Output exactly one JSON object; no surrounding text, no code fences.
+- Top-level keys (required):
+    - `diagnosis` (string): short disease/pest name or "Unknown".
+    - `crop` (string): short crop name from the canonical list (see closed_set_crops) or "Unknown".
+    - `confidence` (float): 0.0-1.0, calibrated to your certainty.
+    - `severity` (string): one of "low", "medium", "high".
+    - `isHealthy` (bool).
+    - `symptoms` (array of short strings).
+    - `treatment` (object) with arrays: `immediateActions`, `organicRemedies`, `futurePrevention`.
+    - `warnings` (array of short strings).
 
-Additional optional keys (helpful but not required):
-- `diagnosisRegional`: regional/localized string
-- `extra`: object with structured extended details for agronomists (see schema below)
+Optional top-level `extra` object may include structured fields: `confidence_breakdown`, `likely_cause`, `affected_parts`, `spread_risk`, `image_angle_advice`, `possible_alternatives` (array of {"diagnosis":str,"confidence":float}), and `chemical_recommendations` (only when `confidence` >= 0.6).
 
-`extra` schema (include where available):
-{
-    "likely_cause": "brief cause hypothesis",
-    "disease_stage": "early|mid|late|unknown",
-    "affected_parts": ["leaves","stems","fruits",...],
-    "spread_risk": "low|medium|high",
-    "confidence_breakdown": {"symptoms":0.0,"image_quality":0.0,"pattern_match":0.0},
-    "chemical_recommendations": [{"active_ingredient":"string","example_tradenames":["name"],"dosage":"e.g. 2g/l","application_interval":"days","pre_harvest_interval_days":int,"safety_notes":"string"}],
-    "monitoring_actions": ["string"],
-    "soil_irrigation_advice": "string",
-    "environmental_triggers": ["high_humidity","recent_rain","cool_temperatures"],
-    "estimated_yield_loss_pct": {"min":0,"max":0},
-    "recommended_followup": ["take underside photo","send sample to lab"],
-    "images_notes": "notes about image quality or suggested additional photos",
-    "references": ["https://..."],
-}
+Behavior and constraints:
+- If multiple plausible diagnoses exist, pick the single most likely one for `diagnosis` and list alternatives in `extra.possible_alternatives` with confidences summing approximately to the remaining mass.
+- Provide a conservative `confidence` when image quality or angle is poor (prefer lower values) and add `image_angle_advice` telling the farmer what to retake (distance, angle, lighting).
+- Only include `extra.chemical_recommendations` when `confidence` >= 0.6. Each chemical recommendation must include `active_ingredient`, `dosage`, `application_interval_days`, `pre_harvest_interval_days`, and `safety_notes`.
+- Keep all farmer-facing text short, actionable, and in plain language.
 
-Formatting and behavior rules:
-- Output MUST be valid JSON parsable by `json.loads()` (no trailing commas, no markdown code fences).
-- Keep farmer-facing strings short and practical (1-2 short sentences max per item).
-- Provide Hindi translations in `diagnosisHindi` when possible and include translations in `extra.localized` if available.
-- Provide numeric `confidence` and a short `confidence_breakdown` inside `extra` explaining major evidence contributors.
-- If uncertain, set `confidence` low (<0.6), set `severity` conservatively, and add a `warnings` entry explaining uncertainty.
-- For chemical recommendations, include safety notes and `pre_harvest_interval_days` when relevant.
-- If image quality is poor, set `confidence` lower and include concrete `images_notes` suggesting retake instructions (angle, lighting, underside, include scale).
-- Keep overall JSON size reasonable; avoid long prose. Use lists of short steps.
+Closed-set crops (use these exact short names when possible; otherwise use "Unknown"): Tomato, Potato, Rice, Wheat, Maize, Chillies, Okra, Eggplant, Cotton, Soybean.
 
-Be concise and precise. Return only the JSON object.
+Return only the single JSON object.
 """
 
 # Groq-specific prompt (uses same schema but tailored language for Groq/LLM-vision)
 GROQ_PROMPT = """
-You are an expert plant pathologist and agricultural advisor. Analyze the given image and RETURN ONLY A SINGLE VALID JSON OBJECT. The top-level keys MUST include `diagnosis`, `crop`, `confidence`, `severity`, `isHealthy`, `symptoms`, `treatment` (with `immediateActions`, `organicRemedies`, `futurePrevention`), and `warnings`. You may include optional keys such as `diagnosis_localized` and an `extra` object for extended actionable details (see DIAGNOSIS_PROMPT for `extra` schema).
+You are an expert plant pathologist and agricultural advisor. Analyze the provided image and RETURN EXACTLY ONE STRICT JSON OBJECT (parsable by json.loads()). Do not output any extra text.
 
-Rules:
-- Output must be strict JSON (no surrounding commentary, no code fences).
-- Provide concise farmer-facing instructions in the `treatment` arrays.
-- Provide `confidence` as a float [0.0-1.0]. If uncertain, lower confidence and add a warning.
-- If you include chemical recommendations inside `extra.chemical_recommendations`, include `active_ingredient`, `dosage`, `application_interval`, and `pre_harvest_interval_days` along with `safety_notes`.
-- If image quality limits diagnosis, include `images_notes` and recommend follow-up photos.
+Required keys: `diagnosis`, `crop`, `confidence`, `severity`, `isHealthy`, `symptoms`, `treatment` (with `immediateActions`,`organicRemedies`,`futurePrevention`), and `warnings`.
+
+Additional rules:
+- Use the closed-set crop names when confident; otherwise `crop` should be "Unknown".
+- `confidence` must be a float between 0.0 and 1.0. If uncertain, set `confidence` < 0.6 and add a short `image_angle_advice` in `extra`.
+- If providing chemical recommendations, include structured fields (`active_ingredient`,`dosage`,`application_interval_days`,`pre_harvest_interval_days`,`safety_notes`). Only provide chemicals when `confidence` >= 0.6.
+- Keep all `treatment` instructions short and actionable for farmers.
+
+Example valid output:
+{"diagnosis":"Early blight","crop":"Tomato","confidence":0.78,"severity":"medium","isHealthy":false,"symptoms":["brown concentric lesions","leaf yellowing"],"treatment":{"immediateActions":["remove affected leaves","improve air flow"],"organicRemedies":["apply neem oil"],"futurePrevention":["rotate crops"]},"warnings":[]}
 
 Return only the JSON object.
 """
@@ -114,41 +127,124 @@ Return only the JSON object.
 
 # Focused prompt for crop detection queries (returns only crop and confidence)
 CROP_PROMPT = """
-You are an expert in identifying crop species from a single leaf or plant image. Return ONLY a JSON object with two keys: `crop` (a short crop name like Tomato, Potato, Rice, Wheat, Maize, Chillies, Okra, etc.) and `confidence` (a float between 0.0 and 1.0). Do not include any other keys or commentary.
-Example valid output: {"crop": "Tomato", "confidence": 0.92}
-If unsure, set `crop` to "Unknown" and `confidence` to a low value.
+You are an image-based crop identifier. RETURN ONLY ONE STRICT JSON OBJECT with exactly two keys:
+- `crop`: one of the canonical short names (exact spelling and capitalization): Tomato, Potato, Rice, Wheat, Maize, Chillies, Okra, Eggplant, Cotton, Soybean, or "Unknown".
+- `confidence`: a numeric float between 0.0 and 1.0 representing the probability that the `crop` label is correct.
+
+Hard rules (must obey exactly):
+- Output only a single JSON object, no surrounding text, no markdown, no commentary, no code fences.
+- Use only the canonical crop names above when your confidence is >= 0.60. If your confidence is < 0.60, set `crop` to "Unknown" and `confidence` to the appropriate low value.
+- Round `confidence` to two decimal places when possible.
+- Do not include any other keys.
+
+If you cannot determine the crop from the image, return {"crop":"Unknown","confidence":0.00}.
+
+Example: {"crop":"Rice","confidence":0.88}
 """
 
 
 # Pixel-level, exhaustive plant analysis prompt
 PIXEL_PROMPT = """
-You are an expert plant pathologist and agronomist. Perform a pixel-to-pixel visual analysis of the provided image and return ONE STRICT JSON OBJECT (no surrounding text) following the schema below. Be exhaustive, precise, and concise. Use measured estimates when possible. If uncertain about any field, provide conservative values and note uncertainty in `warnings`.
+You are a pixel-level plant pathologist and agronomist. RETURN EXACTLY ONE STRICT JSON OBJECT (no surrounding text) that follows this precise schema. Be concise, objective, and use conservative numeric estimates when unsure.
 
-Required top-level keys:
-- `diagnosis`: short disease/pest name or `Unknown` (string)
-- `crop`: crop name (string)
-- `confidence`: float 0.0-1.0
-- `severity`: one of `low|medium|high`
-- `isHealthy`: boolean
-- `symptoms`: array of short symptom strings
-- `affected_parts`: array (e.g., ["leaves","stems","fruits"])
-- `confidence_breakdown`: object with numeric contributions (e.g. {"symptoms":0.6,"image_quality":0.2,"pattern_match":0.2})
-- `treatment`: object with `immediateActions`,`organicRemedies`,`futurePrevention` arrays
-- `spread_risk`: one of `low|medium|high`
-- `estimated_yield_loss_pct`: object {"min":int,"max":int}
-- `images_notes`: short advice about image quality and follow-ups
-- `warnings`: array of short warning strings
-- `extra`: object with optional structured recommendations (chemical_recommendations, monitoring_actions, soil_irrigation_advice, environmental_triggers, references)
+Required fields:
+- `diagnosis` (string) — disease/pest short name or "Unknown".
+- `crop` (string) — canonical crop short name or "Unknown".
+- `confidence` (float 0.0-1.0).
+- `severity` ("low"|"medium"|"high").
+- `isHealthy` (bool).
+- `symptoms` (array of short strings).
+- `affected_parts` (array, e.g., ["leaves","stems","fruits"]).
+- `confidence_breakdown` (object of numeric contributions that sum to ~1.0).
+- `treatment` (object with arrays `immediateActions`,`organicRemedies`,`futurePrevention`).
+- `spread_risk` ("low"|"medium"|"high").
+- `estimated_yield_loss_pct` (object {"min":int,"max":int}).
+- `images_notes` (short string advising retake if needed).
+- `warnings` (array of short strings).
+- Optional `extra` object for structured recommendations.
 
-Behavior rules:
-- Analyze at pixel level: mention specific color/pattern cues (e.g., lesions, chlorosis, necrosis, powdery coating, spots), approximate percent area affected when possible.
-- If multiple plausible diagnoses exist, give the most likely one as `diagnosis` and include alternatives in `extra.possible_alternatives` with confidence scores.
-- When crop identification is uncertain, still return `crop` as best-guess and include `extra.crop_confidence_details`.
-- Keep farmer-facing strings short and actionable. Numeric values should be simple floats or ints.
-- Output MUST be strict JSON parsable by `json.loads()`.
+Behavior:
+- Provide pixel-level evidence in `extra` (e.g., "lesion_color":"brown","percent_area":12).
+- If multiple diagnoses are plausible, set `diagnosis` to the most likely and list alternatives in `extra.possible_alternatives`.
+- Use canonical crop names when possible. If unknown, use "Unknown" and explain briefly in `images_notes` or `extra.crop_confidence_details`.
 
 Return only the JSON object.
 """
+
+SOIL_PROMPT = """
+You are a soil science expert analyzing soil images for farmers. RETURN EXACTLY ONE STRICT JSON OBJECT (no surrounding text) that follows this precise schema:
+
+Required fields:
+- `color_description` (string) — describe the soil color (e.g., "dark brown", "reddish brown", "grey")
+- `dominant_texture` (string) — visual texture assessment ("sandy", "loamy", "clayey", "silty" or combination)
+- `confidence` (float 0.0-1.0) — your confidence in this visual assessment
+- `likely` (object) — visual indicators, e.g.:
+  {
+    "organic_matter": "low"|"moderate"|"high",
+    "moisture_level": "dry"|"moist"|"wet",
+    "pH_range": "acidic (5-6)"|"neutral (6-7)"|"alkaline (7-8)",
+    "compaction": "loose"|"moderate"|"compacted"
+  }
+- `natural_improvements` (array of strings) — farmer-friendly organic recommendations (3-5 items)
+- `suggested_followups` (array of strings) — next steps like "lab pH test", "add compost", etc.
+- `warnings` (array of strings) — any concerns visible (e.g., "possible salinity", "poor drainage")
+- `images_notes` (string) — brief note on image quality or advice to retake
+
+Optional:
+- `extra` (object) — any additional structured data
+
+Behavior:
+- Focus ONLY on soil properties - do NOT mention crops, diseases, or plant health
+- Be conservative with confidence scores for visual-only assessment
+- Provide practical, actionable recommendations for small farmers
+- If image quality is poor, note in `images_notes` and lower confidence
+
+Return only the JSON object.
+"""
+
+def _extract_first_json_object(content: str) -> Dict[str, Any]:
+    """Extract and parse the first JSON object from a text blob.
+
+    Handles cases where providers return a JSON object followed by extra text
+    like reasoning or explanations. Also strips Markdown code fences.
+    """
+    try:
+        txt = (content or "").strip()
+        # Strip markdown fences if present
+        if txt.startswith("```json"):
+            txt = txt[7:]
+        if txt.startswith("```"):
+            txt = txt[3:]
+        if txt.endswith("```"):
+            txt = txt[:-3]
+
+        # Fast path: try full parse
+        try:
+            return json.loads(txt)
+        except Exception:
+            pass
+
+        # Fallback: extract the first balanced {...} block
+        start = txt.find("{")
+        if start == -1:
+            raise ValueError("No JSON object start found")
+        depth = 0
+        end = None
+        for i in range(start, len(txt)):
+            ch = txt[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            raise ValueError("No complete JSON object found")
+        blob = txt[start:end+1]
+        return json.loads(blob)
+    except Exception as e:
+        raise ValueError(f"Failed to parse JSON content: {e}")
 
 
 def _call_groq_with_prompt(image_base64: Optional[str] = None, image_url: Optional[str] = None, prompt: str = GROQ_PROMPT, language: str = "en", extra_message: Optional[str] = None, model: Optional[str] = None, max_tokens: int = 4096, temperature: float = 0.4) -> Dict[str, Any]:
@@ -186,11 +282,16 @@ def _call_groq_with_prompt(image_base64: Optional[str] = None, image_url: Option
         "Authorization": f"Bearer {api_key}",
     }
 
-    with httpx.Client(timeout=120.0) as client:
+    # Avoid inheriting proxy settings; moderate timeout
+    with httpx.Client(timeout=30.0, trust_env=False) as client:
         response = client.post(GROQ_API_URL, json=payload, headers=headers)
-        print(f"[Groq] Custom prompt call status: {response.status_code}")
-        text = response.text[:1000]
-        print(f"[Groq] body preview: {text}...")
+        # Log minimally to avoid flooding console; never crash on log
+        try:
+            print(f"[Groq] Custom prompt call status: {response.status_code}")
+            text = response.text[:300]
+            print(f"[Groq] body preview: {text}...")
+        except Exception:
+            pass
         response.raise_for_status()
         return response.json()
 
@@ -221,6 +322,57 @@ def groq_analyze_full(image_base64: Optional[str] = None, image_url: Optional[st
         except Exception:
             pass
         raise
+
+
+def groq_analyze_soil(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en", extra_message: Optional[str] = None) -> Dict[str, Any]:
+    """Perform soil-focused Groq analysis using SOIL_PROMPT.
+
+    Returns normalized result with soil-specific fields.
+    """
+    try:
+        resp = _call_groq_with_prompt(
+            image_base64=image_base64,
+            image_url=image_url,
+            prompt=SOIL_PROMPT,
+            language=language,
+            extra_message=extra_message,
+            temperature=0.0,
+            max_tokens=4096
+        )
+        choices = resp.get('choices', [])
+        if not choices:
+            raise ValueError("No choices in Groq response")
+        content = choices[0].get('message', {}).get('content', '')
+        if not content:
+            raise ValueError("Empty content in Groq response")
+
+        data = _extract_first_json_object(content)
+        data['pipeline'] = 'groq_soil_analysis'
+        data['provider'] = 'groq'
+        return data
+    except Exception as e:
+        print(f"[Vision][groq_analyze_soil] Groq soil analysis failed: {e}")
+        raise
+
+
+def groq_and_gemini_analyze_soil(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en", extra_message: Optional[str] = None) -> Dict[str, Any]:
+    """Call Groq for soil image analysis (Gemini removed per user request).
+
+    Returns a normalized result similar to `groq_analyze_soil` output.
+    """
+    groq_key = get_groq_api_key()
+
+    if not groq_key:
+        raise ValueError('GROQ_API_KEY not configured')
+
+    # Call Groq only
+    try:
+        out = groq_analyze_soil(image_base64=image_base64, image_url=image_url, language=language, extra_message=extra_message)
+        out['providers'] = [out]
+        return out
+    except Exception as e:
+        print(f"[Vision][groq_and_gemini_analyze_soil] Groq attempt failed: {e}")
+        raise ValueError(f'Groq analysis failed: {str(e)}')
 
 
 def _call_groq_api(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en", extra_message: Optional[str] = None) -> Dict[str, Any]:
@@ -371,19 +523,94 @@ def _parse_groq_response(response: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Error processing Groq response: {e}")
 
 
-def _call_gemini_api(image_base64: str, language: str = "en") -> Dict[str, Any]:
-    """Call Google Gemini API for image analysis."""
-    
-    api_key = get_gemini_api_key()
-    if not api_key:
+def _call_gemini_api(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en", extra_message: Optional[str] = None) -> Dict[str, Any]:
+    """Call Google Gemini API for image analysis.
+
+    Accepts either `image_base64` or `image_url`. If `image_url` is provided,
+    the image will be fetched and base64-encoded before sending to Gemini.
+    """
+
+    api_keys = get_gemini_api_keys()
+    if not api_keys:
         raise ValueError("GEMINI_API_KEY not configured")
-    
+
+    # Normalize input: if image_url provided, fetch and base64-encode
+    if image_url and not image_base64:
+        # Some image URLs (local dev server or slow networks) may time out; retry a few times
+        last_exc = None
+        timeouts = [10.0, 20.0, 30.0]
+        for t in timeouts:
+            try:
+                with httpx.Client(timeout=t) as client:
+                    r = client.get(image_url)
+                    r.raise_for_status()
+                    image_bytes = r.content
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    last_exc = None
+                    break
+            except Exception as e:
+                print(f"[Vision] fetch image_url attempt failed (timeout={t}s): {e}")
+                last_exc = e
+                time.sleep(0.25)
+        if last_exc and not image_base64:
+            raise ValueError(f"Failed to fetch image from URL after retries: {last_exc}")
+
+    if not image_base64:
+        raise ValueError("image_base64 or image_url required for Gemini API")
+
     # Prepare the prompt with language context
     language_name = SUPPORTED_LANGUAGES.get(language, "English")
     prompt = DIAGNOSIS_PROMPT
     if language != "en":
         prompt += f"\n\nAlso provide key information in {language_name} for better understanding by local farmers."
-    
+    # Append any extra user-provided context (soil metadata)
+    if extra_message:
+        prompt += "\n\n[USER_MESSAGE]\n" + extra_message
+
+    # Preflight: attempt to reduce image size for inline/base64 payloads
+    # Large inline images can cause provider REST/client 400 errors; resize/compress when needed.
+    try:
+        if PIL_AVAILABLE and image_base64:
+            img_bytes = base64.b64decode(image_base64)
+            need_reencode = False
+            # Quick check on bytesize
+            if len(img_bytes) > 700_000:  # > ~700KB
+                need_reencode = True
+            if not need_reencode:
+                # also check dimensions
+                try:
+                    with Image.open(BytesIO(img_bytes)) as _img:
+                        w, h = _img.size
+                        if max(w, h) > 1400:
+                            need_reencode = True
+                except Exception:
+                    # if Pillow can't open, leave as-is and hope for the best
+                    need_reencode = False
+
+            if need_reencode:
+                try:
+                    with Image.open(BytesIO(img_bytes)) as img_obj:
+                        img_obj = img_obj.convert("RGB")
+                        max_dim = 1200
+                        w, h = img_obj.size
+                        # Default to original dimensions
+                        new_w, new_h = w, h
+                        if max(w, h) > max_dim:
+                            scale = max_dim / float(max(w, h))
+                            new_w = int(w * scale)
+                            new_h = int(h * scale)
+                            img_obj = img_obj.resize((new_w, new_h), Image.LANCZOS)
+
+                        out = BytesIO()
+                        img_obj.save(out, format="JPEG", quality=75, optimize=True)
+                        out_bytes = out.getvalue()
+                        image_base64 = base64.b64encode(out_bytes).decode('utf-8')
+                        print(f"[Vision] Re-encoded image for Gemini: {len(out_bytes)} bytes, {new_w}x{new_h}")
+                except Exception as e:
+                    print(f"[Vision] Failed to re-encode image for Gemini preflight: {e}")
+    except Exception as e:
+        print(f"[Vision] Error during Gemini image preflight: {e}")
+
     # Prepare request payload
     payload = {
         "contents": [
@@ -411,15 +638,88 @@ def _call_gemini_api(image_base64: str, language: str = "en") -> Dict[str, Any]:
         "Content-Type": "application/json",
     }
     
-    url = f"{GEMINI_API_URL}?key={api_key}"
-    
-    print(f"[Gemini] Calling API with key: {api_key[:10]}...")  # Debug log
-    
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(url, json=payload, headers=headers)
-        print(f"[Gemini] Response status: {response.status_code}")  # Debug log
-        response.raise_for_status()
-        return response.json()
+    last_error: Optional[Exception] = None
+
+    for idx, api_key in enumerate(api_keys):
+        key_label = f"{api_key[:10]}..." if api_key else "<empty>"
+        quota_error = False
+        last_exc_client: Optional[Exception] = None
+
+        # Prefer official client library when available to avoid REST permission mismatches
+        if GENAI_AVAILABLE:
+            try:
+                genai.configure(api_key=api_key)
+                print(f"[Gemini] Using google-generativeai client (key #{idx+1})")
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                last_exc_client = None
+                for attempt in range(3):
+                    try:
+                        try:
+                            resp = model.generate_content(contents=[{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}]}], temperature=0.4, max_output_tokens=4096)
+                        except TypeError:
+                            resp = model.generate_content(contents=[{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}]}])
+
+                        try:
+                            if isinstance(resp, dict):
+                                return resp
+                            text = getattr(resp, 'text', None)
+                            if text is None:
+                                text = str(resp)
+                            return {'candidates': [{'content': {'parts': [{'text': text}]}}]}
+                        except Exception:
+                            return {'candidates': []}
+                    except Exception as e:
+                        last_exc_client = e
+                        msg = str(e).lower()
+                        if '429' in msg or 'quota' in msg:
+                            quota_error = True
+                            break
+                        print(f"[Gemini] client attempt {attempt+1} failed: {e}")
+                        time.sleep((2 ** attempt) * 0.5)
+                if last_exc_client:
+                    print(f"[Gemini] Client all attempts failed: {last_exc_client}")
+            except Exception as e:
+                last_exc_client = e
+                msg = str(e).lower()
+                if '429' in msg or 'quota' in msg:
+                    quota_error = True
+                print(f"[Gemini] Client library configuration failed: {e}")
+        # If client path yielded quota, try next key immediately
+        if quota_error and idx + 1 < len(api_keys):
+            print(f"[Gemini] Key #{idx+1} quota/429, trying next key...")
+            last_error = last_exc_client
+            continue
+
+        try:
+            url = f"{GEMINI_API_URL}?key={api_key}"
+            print(f"[Gemini] Calling API (REST) with key: {key_label}")
+            with httpx.Client(timeout=60.0) as client:
+                response = client.post(url, json=payload, headers=headers)
+                print(f"[Gemini] Response status: {response.status_code}")
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            status = None
+            try:
+                status = e.response.status_code
+            except Exception:
+                status = None
+            if status == 429 and idx + 1 < len(api_keys):
+                print(f"[Gemini] REST 429 for key #{idx+1}; trying next key...")
+                continue
+            raise
+        except Exception as e:
+            last_error = e
+            print(f"[Gemini] REST call failed for key #{idx+1}: {e}")
+            if idx + 1 < len(api_keys):
+                continue
+            raise
+
+    # If we exhausted all keys, surface the last error
+    if last_error:
+        raise last_error
+    raise ValueError("Gemini call failed with no available keys")
 
 
 def _parse_gemini_response(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -484,6 +784,17 @@ def _parse_gemini_response(response: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Error processing Gemini response: {e}")
 
 
+def _provider_snapshot(res: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """Return a deepcopy-like snapshot to avoid circular refs in `providers`."""
+    try:
+        snap = json.loads(json.dumps(res))
+    except Exception:
+        snap = dict(res)
+    snap['provider'] = name
+    snap.pop('providers', None)
+    return snap
+
+
 def diagnose_leaf(image_base64: Optional[str] = None, image_url: Optional[str] = None, crop: Optional[str] = None, language: str = "en", nonce: Optional[int] = None) -> Dict[str, Any]:
     """
     Diagnose leaf disease from base64-encoded image using Groq or Gemini AI.
@@ -529,17 +840,98 @@ def diagnose_leaf(image_base64: Optional[str] = None, image_url: Optional[str] =
                 image_sha = None
             print(f"[Vision] Request nonce: {nonce}, image_sha256: {image_sha}")
 
-        # Try Groq first (better free tier limits)
+        # Try both providers when available. Previously we returned Groq result immediately
+        # which meant Gemini was only used as a fallback. To enable merging/combination
+        # of LLM outputs, call both concurrently when both keys are present.
         groq_key = get_groq_api_key()
         gemini_key = get_gemini_api_key()
-        
+
         print(f"[Vision] Groq API Key configured: {bool(groq_key)}")
         print(f"[Vision] Gemini API Key configured: {bool(gemini_key)}")
-        
+
+        # If both keys configured, call both in parallel and merge results
+        if groq_key and gemini_key:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                    futs = {
+                        'groq': ex.submit(lambda: _parse_groq_response(_call_groq_api(image_base64=image_base64, image_url=image_url, language=language))),
+                        'gemini': ex.submit(lambda: _parse_gemini_response(_call_gemini_api(image_base64=image_base64, image_url=image_url, language=language)))
+                    }
+                    results = {}
+                    for name, fut in futs.items():
+                        try:
+                            results[name] = fut.result(timeout=60)
+                        except Exception as e:
+                            print(f"[Vision] {name} call failed in parallel: {e}")
+                            results[name] = None
+
+                groq_res = results.get('groq')
+                gemini_res = results.get('gemini')
+
+                # If both failed, return demo
+                if not groq_res and not gemini_res:
+                    return _get_demo_response(crop, error='Both providers failed')
+
+                # If only one succeeded, return it
+                if groq_res and not gemini_res:
+                    if crop:
+                        groq_res['crop'] = _normalize_crop_name(crop)
+                        groq_res.setdefault('extra', {})
+                        groq_res['extra']['user_crop_hint_applied'] = True
+                    groq_res['providers'] = [_provider_snapshot(groq_res, 'groq')]
+                    return groq_res
+                if gemini_res and not groq_res:
+                    if crop:
+                        gemini_res['crop'] = _normalize_crop_name(crop)
+                        gemini_res.setdefault('extra', {})
+                        gemini_res['extra']['user_crop_hint_applied'] = True
+                    gemini_res['providers'] = [_provider_snapshot(gemini_res, 'gemini')]
+                    return gemini_res
+
+                # Both present: merge simple strategy
+                # Prefer same diagnosis if both agree (combine confidences)
+                diag_a = groq_res.get('diagnosis', 'Unknown')
+                diag_b = gemini_res.get('diagnosis', 'Unknown')
+                conf_a = float(groq_res.get('confidence', 0.0))
+                conf_b = float(gemini_res.get('confidence', 0.0))
+
+                merged = {}
+                if diag_a.lower() == diag_b.lower() and diag_a != 'Unknown':
+                    combined_conf = 1.0 - (1.0 - conf_a) * (1.0 - conf_b)
+                    merged = groq_res.copy()
+                    merged['confidence'] = min(max(round(combined_conf, 3), 0.0), 1.0)
+                    merged['providers'] = [
+                        _provider_snapshot(groq_res, 'groq'),
+                        _provider_snapshot(gemini_res, 'gemini'),
+                    ]
+                else:
+                    # pick higher confidence diagnosis
+                    if conf_a >= conf_b:
+                        merged = groq_res.copy()
+                    else:
+                        merged = gemini_res.copy()
+                    merged['providers'] = [
+                        _provider_snapshot(groq_res, 'groq'),
+                        _provider_snapshot(gemini_res, 'gemini'),
+                    ]
+
+                # override crop hint if provided by user (normalize and mark)
+                if crop:
+                    merged['crop'] = _normalize_crop_name(crop)
+                    merged.setdefault('extra', {})
+                    merged['extra']['user_crop_hint_applied'] = True
+                    # boost confidence conservatively to reflect user's prior
+                    merged['confidence'] = max(merged.get('confidence', 0.0), 0.75)
+                return merged
+            except Exception as e:
+                print(f"[Vision] Parallel provider merge failed: {e}")
+                # Fall back to single-provider attempts below
+
+        # If only one provider available, use it as before
         if groq_key:
             try:
                 print("[Vision] Trying Groq API...")
-                response = _call_groq_api(image_base64=image_base64, image_url=image_url, language=language)
+                response = _call_groq_api(image_base64=image_base64, image_url=image_url, language=language, extra_message=extra_message)
                 result = _parse_groq_response(response)
                 print("[Vision] Groq API success!")
                 if crop:
@@ -547,12 +939,11 @@ def diagnose_leaf(image_base64: Optional[str] = None, image_url: Optional[str] =
                 return result
             except Exception as e:
                 print(f"[Vision] Groq API failed: {e}")
-                # Fall through to try Gemini
-        
+
         if gemini_key:
             try:
                 print("[Vision] Trying Gemini API...")
-                response = _call_gemini_api(image_base64, language)
+                response = _call_gemini_api(image_base64=image_base64, image_url=image_url, language=language, extra_message=extra_message)
                 result = _parse_gemini_response(response)
                 print("[Vision] Gemini API success!")
                 if crop:
@@ -561,10 +952,10 @@ def diagnose_leaf(image_base64: Optional[str] = None, image_url: Optional[str] =
             except Exception as e:
                 print(f"[Vision] Gemini API failed: {e}")
                 return _get_demo_response(crop, error=str(e))
-        
+
         # No API keys configured
         return _get_demo_response(crop)
-        
+
     except Exception as e:
         print(f"Diagnosis error: {e}")
         return _get_demo_response(crop, error=str(e))
@@ -619,34 +1010,275 @@ def _call_groq_crop_api(image_base64: Optional[str] = None, image_url: Optional[
         return response.json()
 
 
-def groq_detect_crop(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en") -> Dict[str, Any]:
-    """Return a minimal dict {crop, confidence} by asking Groq specifically for crop detection."""
-    resp = _call_groq_crop_api(image_base64=image_base64, image_url=image_url, language=language)
-    # parse minimal response
-    try:
-        choices = resp.get("choices", [])
-        if not choices:
-            raise ValueError("No choices in groq crop response")
-        raw = choices[0].get("message", {}).get("content", "")
-        if isinstance(raw, dict):
-            data = raw
-        else:
-            text = str(raw).strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            data = json.loads(text)
+def _call_gemini_crop_api(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en") -> Dict[str, Any]:
+    """Call Gemini with a focused crop-detection prompt that returns only crop+confidence."""
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not configured")
 
-        crop = data.get("crop") or data.get("label") or "Unknown"
-        confidence = float(data.get("confidence", 0.0))
-        confidence = min(max(confidence, 0.0), 1.0)
-        return {"crop": crop, "confidence": confidence}
-    except Exception as e:
-        return {"crop": "Unknown", "confidence": 0.0}
+    language_name = SUPPORTED_LANGUAGES.get(language, "English")
+    prompt = CROP_PROMPT
+    if language != "en":
+        prompt += f"\nAlso provide crop name in {language_name} if possible."
+
+    # Build payload similar to _call_gemini_api but with focused prompt
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_base64
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "topK": 1,
+            "topP": 1,
+            "maxOutputTokens": 256,
+        }
+    }
+
+    # Prefer client library to avoid REST permission/model-method mismatch
+    if GENAI_AVAILABLE:
+        try:
+            genai.configure(api_key=api_key)
+            print("[Gemini] Using google-generativeai client for crop detection")
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            try:
+                resp = model.generate_content(contents=[{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}]}], temperature=0.0, max_output_tokens=256)
+            except TypeError:
+                resp = model.generate_content(contents=[{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}]}])
+
+            try:
+                if isinstance(resp, dict):
+                    return resp
+                text = getattr(resp, 'text', None)
+                if text is None:
+                    text = str(resp)
+                return {'candidates': [{'content': {'parts': [{'text': text}]}}]}
+            except Exception:
+                return {'candidates': []}
+        except Exception as e:
+            print(f"[Gemini] Client library crop call failed: {e}")
+            # Fall back to REST below
+
+    headers = {"Content-Type": "application/json"}
+    url = f"{GEMINI_API_URL}?key={api_key}"
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+
+def groq_detect_crop(image_base64: Optional[str] = None, image_url: Optional[str] = None, language: str = "en") -> Dict[str, Any]:
+    """Call both Groq and Gemini (when configured) concurrently and combine their crop guesses."""
+    results = []
+
+    def call_groq():
+        try:
+            print("[Vision][groq_detect_crop] calling Groq crop API")
+            resp = _call_groq_crop_api(image_base64=image_base64, image_url=image_url, language=language)
+            choices = resp.get("choices", [])
+            raw = choices[0].get("message", {}).get("content", "") if choices else ""
+            parsed = None
+            if isinstance(raw, dict):
+                parsed = raw
+            else:
+                t = str(raw).strip()
+                if t.startswith("```json"): t = t[7:]
+                if t.startswith("```"): t = t[3:]
+                if t.endswith("```"): t = t[:-3]
+                t = t.strip()
+                try:
+                    parsed = json.loads(t)
+                except Exception:
+                    s = t.find('{')
+                    e = t.rfind('}')
+                    if s != -1 and e != -1 and e > s:
+                        try:
+                            parsed = json.loads(t[s:e+1])
+                        except Exception:
+                            parsed = None
+                if parsed is None:
+                    parsed = {}
+                    single = t.splitlines()[0].strip() if t else ''
+                    if single.startswith('"') and single.endswith('"'):
+                        single = single[1:-1]
+                    if ':' in single:
+                        parts = single.split(':', 1)
+                        key = parts[0].strip().lower()
+                        val = parts[1].strip()
+                        if key in ('crop', 'label'):
+                            parsed['crop'] = val
+                    else:
+                        parsed['crop'] = single
+            crop = (parsed.get('crop') or parsed.get('label') or parsed.get('label_text') or 'Unknown').strip() if parsed else 'Unknown'
+            conf = 0.0
+            try:
+                conf = float(parsed.get('confidence', 0.0)) if parsed else 0.0
+            except Exception:
+                conf = 0.0
+            return {'source': 'groq', 'crop': _normalize_crop_name(crop), 'confidence': min(max(conf, 0.0), 1.0)}
+        except Exception as e:
+            print(f"[Vision][groq_detect_crop] Groq call failed: {e}")
+            return {'source': 'groq', 'crop': 'Unknown', 'confidence': 0.0, 'error': str(e)}
+
+    def call_gemini():
+        try:
+            print("[Vision][groq_detect_crop] calling Gemini crop API")
+            resp = _call_gemini_crop_api(image_base64=image_base64, image_url=image_url, language=language)
+            candidates = resp.get('candidates', [])
+            text = ''
+            if candidates:
+                content = candidates[0].get('content', {})
+                parts = content.get('parts', [])
+                if parts:
+                    text = parts[0].get('text', '')
+            t = (text or '').strip()
+            if t.startswith('```json'): t = t[7:]
+            if t.startswith('```'): t = t[3:]
+            if t.endswith('```'): t = t[:-3]
+            parsed = None
+            try:
+                parsed = json.loads(t)
+            except Exception:
+                s = t.find('{')
+                e = t.rfind('}')
+                if s != -1 and e != -1 and e > s:
+                    try:
+                        parsed = json.loads(t[s:e+1])
+                    except Exception:
+                        parsed = None
+            if parsed is None:
+                parsed = {}
+                single = t.splitlines()[0].strip() if t else ''
+                if single.startswith('"') and single.endswith('"'):
+                    single = single[1:-1]
+                if ':' in single:
+                    parts = single.split(':', 1)
+                    key = parts[0].strip().lower()
+                    val = parts[1].strip()
+                    if key in ('crop', 'label'):
+                        parsed['crop'] = val
+                else:
+                    parsed['crop'] = single
+            crop = (parsed.get('crop') or 'Unknown').strip()
+            conf = 0.0
+            try:
+                conf = float(parsed.get('confidence', 0.0))
+            except Exception:
+                conf = 0.0
+            return {'source': 'gemini', 'crop': _normalize_crop_name(crop), 'confidence': min(max(conf, 0.0), 1.0)}
+        except Exception as e:
+            print(f"[Vision][groq_detect_crop] Gemini call failed: {e}")
+            return {'source': 'gemini', 'crop': 'Unknown', 'confidence': 0.0, 'error': str(e)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        groq_key = get_groq_api_key()
+        gemini_key = get_gemini_api_key()
+        futs = {}
+        if groq_key:
+            futs['groq'] = ex.submit(call_groq)
+        if gemini_key:
+            futs['gemini'] = ex.submit(call_gemini)
+        for name, fut in futs.items():
+            try:
+                r = fut.result(timeout=30)
+                if r:
+                    # preserve raw provider result for debugging/merging
+                    results.append(r)
+            except Exception:
+                continue
+
+    if not results:
+        return {'crop': 'Unknown', 'confidence': 0.0, 'providers': []}
+    if len(results) == 1:
+        return {'crop': results[0]['crop'], 'confidence': results[0]['confidence'], 'providers': [results[0]]}
+    a = results[0]
+    b = results[1]
+    # If both providers agree on crop and not Unknown, combine confidences (probabilistic union)
+    if a['crop'].lower() == b['crop'].lower() and a['crop'] != 'Unknown':
+        c1 = a['confidence']
+        c2 = b['confidence']
+        combined = 1.0 - (1.0 - c1) * (1.0 - c2)
+        combined = min(max(combined, 0.0), 1.0)
+        return {'crop': a['crop'], 'confidence': round(combined, 3), 'providers': [a, b]}
+
+    # If one provider is clearly more confident, prefer it (strong margin)
+    if a['confidence'] >= b['confidence'] + 0.20:
+        return {'crop': a['crop'], 'confidence': a['confidence'], 'providers': [a, b]}
+    if b['confidence'] >= a['confidence'] + 0.20:
+        return {'crop': b['crop'], 'confidence': b['confidence'], 'providers': [a, b]}
+
+    # If both low confidence (<0.60), attempt local classifier fallback
+    try:
+        max_conf = max(a.get('confidence', 0.0), b.get('confidence', 0.0))
+        if max_conf < 0.60:
+            try:
+                model, classes = load_crop_classifier()
+                if model and classes:
+                    clf = run_crop_classifier(model, classes, image_base64)
+                    clf_crop = _normalize_crop_name(clf.get('crop', 'Unknown'))
+                    clf_conf = float(clf.get('confidence', 0.0))
+                    print(f"[Vision][groq_detect_crop] local classifier suggested {clf_crop} ({clf_conf})")
+                    # Use classifier if it has higher confidence than LLMs
+                    if clf_conf > max_conf and clf_conf >= 0.50:
+                        return {'crop': clf_crop, 'confidence': round(clf_conf, 3), 'providers': [a, b, {'source': 'local_classifier', 'crop': clf_crop, 'confidence': clf_conf}]}
+            except Exception as e:
+                print(f"[Vision][groq_detect_crop] local classifier failed: {e}")
+    except Exception:
+        pass
+
+    # If confidences close, pick the higher one (default tie-breaker prefers Groq as primary)
+    if abs(a['confidence'] - b['confidence']) <= 0.15:
+        primary = a if a['confidence'] >= b['confidence'] else b
+        return {'crop': primary['crop'], 'confidence': primary['confidence'], 'providers': [a, b]}
+
+    primary = a if a['confidence'] >= b['confidence'] else b
+    return {'crop': primary['crop'], 'confidence': primary['confidence'], 'providers': [a, b]}
+
+
+def _normalize_crop_name(raw: str) -> str:
+    """Map various crop labels/synonyms to canonical short English names."""
+    if not raw:
+        return "Unknown"
+    s = raw.strip().lower()
+    # common mappings
+    mapping = {
+        'tomato': ['tomato', 'tomatoes', 'solanum lycopersicum', 'टमाटर'],
+        'potato': ['potato', 'potatoes', 'solanum tuberosum', 'आलू'],
+        'rice': ['rice', 'paddy', 'paddy rice', 'धान', 'चावल'],
+        'wheat': ['wheat', 'गेहूँ', 'गेहू'],
+        'maize': ['maize', 'corn', 'भुट्टा', 'मक्का'],
+        'chillies': ['chilli', 'chillies', 'chili', 'capsicum', 'मिर्च', 'mirchi'],
+        'okra': ['okra', 'bhindi', 'भिन्डी', 'ladyfinger'],
+        'eggplant': ['eggplant', 'brinjal', 'बैंगन', 'brinjol'],
+        'soybean': ['soybean', 'soy', 'soybeans'],
+        'sugarcane': ['sugarcane', 'cane'],
+        'cotton': ['cotton'],
+        'unknown': ['unknown', 'unsure', 'not sure']
+    }
+    # direct match
+    for canon, variants in mapping.items():
+        for v in variants:
+            if s == v:
+                return canon.capitalize() if canon != 'unknown' else 'Unknown'
+    # substring match
+    for canon, variants in mapping.items():
+        for v in variants:
+            if v in s:
+                return canon.capitalize() if canon != 'unknown' else 'Unknown'
+    # fallback: capitalize raw but remove quotes
+    s_clean = raw.strip().strip('"').strip("'")
+    if not s_clean:
+        return 'Unknown'
+    return s_clean.capitalize()
 
 
 def _get_demo_response(crop: Optional[str] = None, error: Optional[str] = None) -> Dict[str, Any]:
@@ -872,6 +1504,95 @@ def run_vit_stage_classifier(model, image_patch_base64: str) -> Dict[str, Any]:
         return {"stage": stage, "confidence": confidence}
     except Exception as e:
         return {"stage": "moderate", "confidence": 0.6, "error": str(e)}
+
+
+def load_crop_classifier(model_path: str = "models/crop_vit.pth", classes_path: str = "models/crop_classes.json"):
+    """Load a simple local crop classifier and class list. Returns (model, classes) or (None, [])."""
+    if not TORCH_AVAILABLE:
+        return None, []
+    try:
+        import torch.nn as nn
+        import torch
+        import json
+        # Define same architecture as training stub
+        class SimpleCNN(nn.Module):
+            def __init__(self, num_classes):
+                super().__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    nn.Conv2d(32, 64, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    nn.Conv2d(64, 128, 3, padding=1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((4,4)),
+                )
+                self.classifier = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(128*4*4, 256),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(256, num_classes),
+                )
+            def forward(self, x):
+                x = self.features(x)
+                x = self.classifier(x)
+                return x
+
+        # Load classes
+        classes = []
+        if os.path.exists(classes_path):
+            with open(classes_path, 'r', encoding='utf-8') as f:
+                try:
+                    classes = json.load(f)
+                except Exception:
+                    classes = []
+
+        num_classes = max(1, len(classes))
+        model = SimpleCNN(num_classes=num_classes)
+        if os.path.exists(model_path):
+            try:
+                state = torch.load(model_path, map_location='cpu')
+                model.load_state_dict(state)
+            except Exception:
+                pass
+        model.eval()
+        return model, classes
+    except Exception:
+        return None, []
+
+
+def run_crop_classifier(model, classes, image_base64: str) -> Dict[str, Any]:
+    """Run the crop classifier on a base64 image and return {crop, confidence}.
+    If model is None, returns Unknown with 0.0 confidence.
+    """
+    if model is None or not classes:
+        return {"crop": "Unknown", "confidence": 0.0}
+    try:
+        import base64
+        import io
+        from PIL import Image
+        import torch
+        import torchvision.transforms as T
+        decoded = base64.b64decode(image_base64)
+        img = Image.open(io.BytesIO(decoded)).convert('RGB')
+        transform = T.Compose([
+            T.Resize((128,128)),
+            T.ToTensor(),
+        ])
+        t = transform(img).unsqueeze(0)
+        with torch.no_grad():
+            out = model(t)
+            probs = torch.softmax(out.squeeze(), dim=0).cpu().numpy()
+        import numpy as np
+        idx = int(np.argmax(probs))
+        crop = classes[idx] if idx < len(classes) else 'Unknown'
+        confidence = float(probs[idx])
+        return {"crop": crop, "confidence": confidence}
+    except Exception:
+        return {"crop": "Unknown", "confidence": 0.0}
 
 
 def poi_using_models(image_base64: str) -> Dict[str, Any]:

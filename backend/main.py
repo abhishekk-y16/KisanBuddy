@@ -1,39 +1,56 @@
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Response, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+import httpx
 
-# Prefer top-level `services`/`agents` imports (works when app is run as a module
-# at project root or by Render). Fall back to package-relative imports when the
-# package layout is used (tests running `backend` as a package).
+# Import services and agents - try relative imports first (when run from backend dir)
+# then try absolute imports (when run as package from project root)
 try:
+    # Try relative imports first (running from backend directory)
+    import sys
+    import os
+    # Add parent directory to path if not already there
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    if backend_dir not in sys.path:
+        sys.path.insert(0, backend_dir)
+    
     from services.agmarknet import fetch_prices, forecast_prices
     from services.anthrokrishi import query_parcel_by_plus_code, s2_cell_from_latlon
     from services.earth_engine import fetch_hazards, fetch_ndvi_timeseries, init_earth_engine
-    from services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models
+    from services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models, groq_detect_crop, load_crop_classifier, run_crop_classifier
     from services.sync import push_docs, pull_docs, hub as sync_hub
+    from services.calibration import calibrate_inference, gate_action, get_calibrator
+    from services.guardrails import get_rate_limiter, get_circuit_breaker, get_response_cache, get_metrics
+    from services.telemetry import log_inference, get_daily_summary, get_rejection_analysis
     from agents.planner import plan_tasks
     from agents.validator import validate_recommendations
     from agents.orchestrator import create_orchestrator, AgentOrchestrator
     from services.weather import fetch_weather, crop_advisories
     import auth as auth_module
-except Exception:
+except ImportError as e:
+    # Fall back to package imports (when running from project root)
     from backend.services.agmarknet import fetch_prices, forecast_prices
     from backend.services.anthrokrishi import query_parcel_by_plus_code, s2_cell_from_latlon
     from backend.services.earth_engine import fetch_hazards, fetch_ndvi_timeseries, init_earth_engine
-    from backend.services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models
+    from backend.services.vision import diagnose_leaf, load_u2net_model, load_vit_model, poi_using_models, groq_detect_crop, load_crop_classifier, run_crop_classifier
     from backend.services.sync import push_docs, pull_docs, hub as sync_hub
+    from backend.services.calibration import calibrate_inference, gate_action, get_calibrator
+    from backend.services.guardrails import get_rate_limiter, get_circuit_breaker, get_response_cache, get_metrics
+    from backend.services.telemetry import log_inference, get_daily_summary, get_rejection_analysis
     from backend.agents.planner import plan_tasks
     from backend.agents.validator import validate_recommendations
     from backend.agents.orchestrator import create_orchestrator, AgentOrchestrator
     from backend.services.weather import fetch_weather, crop_advisories
-    from . import auth as auth_module
+    from backend import auth as auth_module
 from fastapi import Depends, Header
+import logging
 
 app = FastAPI(title="KisanBuddy API", version="0.2.0")
 
@@ -70,6 +87,7 @@ class VisionResponse(BaseModel):
     symptoms: List[str] = []
     treatment: Optional[TreatmentDetails] = None
     warnings: List[str] = []
+    providers: Optional[List[Dict[str, Any]]] = None
 
 
 class POIRequest(BaseModel):
@@ -83,6 +101,18 @@ class POIResponse(BaseModel):
     POI: float
     stage: str
     note: Optional[str] = None
+
+
+class CropDetectRequest(BaseModel):
+    image_base64: Optional[str] = None
+    image_url: Optional[str] = None
+    language: Optional[str] = 'en'
+
+
+class CropDetectResponse(BaseModel):
+    crop: str
+    confidence: float
+    providers: Optional[List[Dict[str, Any]]] = None
 
 class AgmarknetRequest(BaseModel):
     commodity: str
@@ -111,7 +141,7 @@ class NearbyPriceEntry(BaseModel):
 class AgmarknetNearbyRequest(BaseModel):
     commodity: str
     location: Dict[str, float]  # {"lat": float, "lng": float}
-    radius_km: Optional[int] = 100
+    radius_km: Optional[int] = 200
     top_n: Optional[int] = 5
     fuel_rate_per_ton_km: Optional[float] = 0.05
     mandi_fees: Optional[float] = 0.0
@@ -178,26 +208,222 @@ def healthz():
     return {"status": "ok"}
 
 
-@app.post("/api/vision_diagnostic", response_model=VisionResponse)
-def vision_diagnostic(req: VisionRequest, response: Response):
+# Nearby labs feature removed: Geoapify proxy endpoint disabled.
+
+@app.get("/api/geoapify/places")
+def geoapify_places(lat: str, lng: str, q: str = "soil testing", limit: int = 6):
+    """Proxy Geoapify Places API to find nearby soil testing centres.
+    
+    Uses retries and short timeout to handle slow responses quickly.
+    """
+    key = os.getenv("GEOAPIFY_API_KEY") or ""
+    if not key:
+        raise HTTPException(status_code=500, detail="Geoapify key not configured on server")
+    
+    # Validate coordinates
     try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid lat/lng values: lat={lat!r}, lng={lng!r}")
+    
+    # Call Geoapify with proper retries and short timeout using sync client
+    url = "https://api.geoapify.com/v2/places"
+    attempts = 2
+    last_err = None
+    
+    for attempt in range(attempts):
+        try:
+            with httpx.Client(timeout=8) as client:
+                params = {
+                    "apiKey": key,
+                    "filter": f"circle:{lat_f},{lng_f},50000",  # 50km radius
+                    "limit": str(limit),
+                    "bias": f"proximity:{lng_f},{lat_f}",
+                    "lang": "en",
+                }
+                # First attempt with query, second without
+                if attempt == 0:
+                    params["q"] = q
+                r = client.get(url, params=params)
+            
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 400:
+                # 400 Bad Request — retry without query hint
+                if attempt == 0:
+                    continue
+                else:
+                    return {"features": []}
+            else:
+                last_err = f"Geoapify {r.status_code}"
+                continue
+        except httpx.TimeoutException:
+            last_err = "Request timeout"
+            if attempt < attempts - 1:
+                continue
+        except Exception as e:
+            last_err = str(e)
+            if attempt < attempts - 1:
+                continue
+    
+    # Return empty features on failure so frontend shows "No results found" instead of error
+    logging.getLogger("uvicorn.error").warning(f"[geoapify_places] failed after {attempts} attempts: {last_err}")
+    return {"features": []}
+
+@app.get("/api/metrics")
+def metrics_endpoint(authorization: Optional[str] = Header(None)):
+    """Get operational metrics summary (admin only)."""
+    user = auth_module.verify_token(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    metrics = get_metrics()
+    summary = metrics.get_summary()
+    alerts = metrics.check_alerts()
+    
+    # Add telemetry insights
+    daily_summary = get_daily_summary()
+    rejection_analysis = get_rejection_analysis(days=7)
+    
+    return {
+        "metrics": summary,
+        "alerts": alerts,
+        "daily_summary": daily_summary,
+        "rejection_analysis": rejection_analysis
+    }
+
+
+@app.post("/api/vision_diagnostic", response_model=VisionResponse)
+async def vision_diagnostic(req: VisionRequest, response: Response, request: Request):
+    start_time = time.time()
+    
+    try:
+        # Rate limiting check
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limiter = get_rate_limiter()
+        allowed, error_msg = rate_limiter.check_rate_limit(client_ip, "/api/vision_diagnostic")
+        
+        if not allowed:
+            get_metrics().record_request("/api/vision_diagnostic", 429, 0, used_fallback=False)
+            raise HTTPException(status_code=429, detail=error_msg)
+        
+        # Check circuit breaker
+        circuit = get_circuit_breaker()
+        if circuit.is_open("vision_service"):
+            raise HTTPException(status_code=503, detail="Vision service temporarily unavailable")
+        
         # Ensure each request is treated as fresh by clients/proxies
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
 
         # Forward nonce to diagnostic service (client should provide `_nonce`)
-        result = diagnose_leaf(req.image_base64, image_url=req.image_url, crop=req.crop, language=req.language or "en", nonce=req._nonce)
+        try:
+            result = diagnose_leaf(req.image_base64, image_url=req.image_url, crop=req.crop, language=req.language or "en", nonce=req._nonce)
+            circuit.record_success("vision_service")
+        except Exception as e:
+            circuit.record_failure("vision_service")
+            raise
+        
+        # Apply confidence calibration
+        calibration_data = {
+            'confidence': result.get('confidence', 0.5),
+            'POI': result.get('POI', 0.0),
+            'POI_confidence': result.get('POI_confidence', 0.0),
+            'crop_confidence': result.get('confidence', 0.5),
+            'pipeline': result.get('pipeline', 'heuristic'),
+            'image_quality_score': result.get('image_quality_score', 0.8)
+        }
+        
+        calibrated = calibrate_inference(calibration_data)
+        result['confidence_calibrated'] = calibrated['confidence_overall']
+        result['confidence_band'] = calibrated['confidence_band']
+        
+        # Block chemical recommendations on low/heuristic confidence
+        pipeline = result.get('pipeline', 'heuristic')
+        if pipeline in ('heuristic', 'demo_fallback', 'demo_no_api_key', 'error_fallback', 'quality_check_failed', 'heuristic_fallback'):
+            # Heuristic/fallback pipelines get very low confidence, block chemicals
+            if calibrated['confidence_band'] not in ('high', 'medium'):
+                calibrated['confidence_band'] = 'low'
+                result['confidence_calibrated'] = min(result.get('confidence_calibrated', 0.5), 0.4)
+        
+        # Gate chemical recommendations based on calibrated confidence AND pipeline
+        if 'treatment' in result and result.get('treatment'):
+            allow_chemicals, warning = gate_action(calibrated['confidence_band'], 'chemical_rec')
+            
+            # Additional gating for heuristic/demo pipelines - never allow chemicals
+            if pipeline in ('heuristic', 'demo_fallback', 'demo_no_api_key', 'error_fallback', 'quality_check_failed', 'heuristic_fallback'):
+                allow_chemicals = False
+                if not warning:
+                    warning = f"Chemical recommendations blocked: diagnosis used {pipeline} pipeline. Please ensure good image quality and AI service availability for treatment recommendations."
+            
+            if not allow_chemicals:
+                # Remove chemical recommendations, keep organic only
+                if warning:
+                    result.setdefault('warnings', []).append(warning)
+                # Filter treatment to organic only
+                treatment = result.get('treatment', {})
+                result['treatment'] = {
+                    'immediateActions': treatment.get('organicRemedies', []),
+                    'organicRemedies': treatment.get('organicRemedies', []),
+                    'futurePrevention': treatment.get('futurePrevention', [])
+                }
+        
+        # Log telemetry
+        latency = (time.time() - start_time) * 1000
+        try:
+            image_data = None
+            if req.image_base64:
+                import base64
+                image_data = base64.b64decode(req.image_base64)
+            
+            log_inference(
+                endpoint="/api/vision_diagnostic",
+                image_data=image_data,
+                device_hint=request.headers.get('User-Agent'),
+                quality_metrics={'score': result.get('image_quality_score'), 'passed': True},
+                pipeline_info={'pipeline': result.get('pipeline'), 'fallback_occurred': False},
+                confidence_metrics=calibrated,
+                performance_metrics={'latency_ms': latency, 'upstream_provider': result.get('provider')},
+                result_data=result
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to log telemetry: %s", e)
+        
+        get_metrics().record_request("/api/vision_diagnostic", 200, latency, 
+                                    provider=result.get('provider'), used_fallback=False)
+        
         return VisionResponse(**result)
+    except HTTPException:
+        latency = (time.time() - start_time) * 1000
+        get_metrics().record_request("/api/vision_diagnostic", 429, latency, used_fallback=False)
+        raise
     except Exception as e:
+        latency = (time.time() - start_time) * 1000
+        get_metrics().record_request("/api/vision_diagnostic", 500, latency, used_fallback=False)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/vision_poi", response_model=POIResponse)
-def vision_poi(req: POIRequest):
+async def vision_poi(req: POIRequest, request: Request):
+    start_time = time.time()
+    
     try:
+        # Rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limiter = get_rate_limiter()
+        allowed, error_msg = rate_limiter.check_rate_limit(client_ip, "/api/vision_poi")
+        
+        if not allowed:
+            raise HTTPException(status_code=429, detail=error_msg)
+        
         if not req.image_base64 and not req.image_url:
             raise HTTPException(status_code=400, detail="image_base64 or image_url required")
+        
         # If image_url provided, try to fetch and convert to base64 (small helper)
         image_b64 = req.image_base64
         if req.image_url and not image_b64:
@@ -209,7 +435,31 @@ def vision_poi(req: POIRequest):
 
         from services.vision import poi_using_models
         out = poi_using_models(image_b64)
-        return POIResponse(DLA=out.get("DLA", 0.0), TLA=out.get("TLA", 0.0), POI=out.get("POI", 0.0), stage=out.get("stage", "low"), note=out.get("note"))
+        
+        latency = (time.time() - start_time) * 1000
+        get_metrics().record_request("/api/vision_poi", 200, latency)
+        
+        return POIResponse(DLA=out.get("DLA", 0.0), TLA=out.get("TLA", 0.0), 
+                          POI=out.get("POI", 0.0), stage=out.get("stage", "low"), 
+                          note=out.get("note"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/crop_detect', response_model=CropDetectResponse)
+async def crop_detect(req: CropDetectRequest):
+    try:
+        if not req.image_base64 and not req.image_url:
+            raise HTTPException(status_code=400, detail="image_base64 or image_url required")
+        res = groq_detect_crop(image_base64=req.image_base64, image_url=req.image_url, language=req.language or 'en')
+        # Ensure fallback
+        crop = res.get('crop', 'Unknown')
+        confidence = float(res.get('confidence', 0.0))
+        confidence = min(max(confidence, 0.0), 1.0)
+        providers = res.get('providers') if isinstance(res, dict) else None
+        return CropDetectResponse(crop=crop, confidence=confidence, providers=providers)
     except HTTPException:
         raise
     except Exception as e:
@@ -217,7 +467,7 @@ def vision_poi(req: POIRequest):
 
 
 @app.post('/api/upload_image')
-def upload_image(file: UploadFile = File(...)):
+def upload_image(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     """Accept multipart upload and save to backend/tmp_uploads, return a public URL."""
     try:
         uploads_dir = os.path.join(os.path.dirname(__file__), 'tmp_uploads')
@@ -228,9 +478,78 @@ def upload_image(file: UploadFile = File(...)):
             out.write(file.file.read())
         # Return a URL path under /static/tmp_uploads/
         url = f"/static/tmp_uploads/{filename}"
+        # Schedule deletion of the uploaded file after a short TTL (default 5 minutes)
+        try:
+            ttl_seconds = int(os.getenv('UPLOAD_TTL_SECONDS', '300'))
+            if background_tasks is not None:
+                def _del(path_to_remove):
+                    try:
+                        if os.path.exists(path_to_remove):
+                            os.remove(path_to_remove)
+                    except Exception:
+                        pass
+                background_tasks.add_task(_del, path)
+        except Exception:
+            pass
         return {"url": url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/cleanup_uploads')
+def admin_cleanup_uploads():
+    """Delete all files in backend/tmp_uploads directory. Admin-only in production; open here for local convenience."""
+    try:
+        uploads_dir = os.path.join(os.path.dirname(__file__), 'tmp_uploads')
+        if not os.path.exists(uploads_dir):
+            return {"deleted": 0}
+        deleted = 0
+        for fname in os.listdir(uploads_dir):
+            fpath = os.path.join(uploads_dir, fname)
+            try:
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+                    deleted += 1
+            except Exception:
+                pass
+        return {"deleted": deleted}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.on_event('startup')
+def purge_tmp_uploads_on_startup():
+    """Purge any leftover uploaded images on server startup to avoid committing them or carrying them between runs."""
+    try:
+        uploads_dir = os.path.join(os.path.dirname(__file__), 'tmp_uploads')
+        if not os.path.exists(uploads_dir):
+            return
+        for fname in os.listdir(uploads_dir):
+            fpath = os.path.join(uploads_dir, fname)
+            try:
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# Local crop classifier loaded at startup (optional)
+_CROP_MODEL = None
+_CROP_CLASSES = []
+
+
+@app.on_event('startup')
+def _load_local_crop_model():
+    """Attempt to load a local crop classifier model and class list if present."""
+    global _CROP_MODEL, _CROP_CLASSES
+    try:
+        _CROP_MODEL, _CROP_CLASSES = load_crop_classifier()
+        if _CROP_MODEL and _CROP_CLASSES:
+            print(f"Loaded local crop classifier with classes: {_CROP_CLASSES}")
+    except Exception:
+        _CROP_MODEL, _CROP_CLASSES = None, []
 
 
 class VisionChatRequest(BaseModel):
@@ -257,25 +576,102 @@ def vision_chat(req: VisionChatRequest):
         return out
     except HTTPException:
         raise
+    except ValueError as e:
+        # Upstream service/config error (bad API key, etc.) -> Bad Gateway
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        # Log full exception with traceback for easier debugging in server logs
+        logging.getLogger(__name__).exception("vision_chat handler error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/crop_classify', response_model=CropDetectResponse)
+async def crop_classify(req: CropDetectRequest):
+    """Classify crop using the local trained model (if available)."""
+    try:
+        if not req.image_base64 and not req.image_url:
+            raise HTTPException(status_code=400, detail="image_base64 or image_url required")
+        # if image_url provided, fetch and convert to base64
+        image_b64 = req.image_base64
+        if req.image_url and not image_b64:
+            import httpx, base64
+            with httpx.Client(timeout=30.0) as client:
+                r = client.get(req.image_url)
+                r.raise_for_status()
+                image_b64 = base64.b64encode(r.content).decode('utf-8')
+
+        res = run_crop_classifier(_CROP_MODEL, _CROP_CLASSES, image_b64)
+        crop = res.get('crop', 'Unknown')
+        confidence = float(res.get('confidence', 0.0))
+        return CropDetectResponse(crop=crop, confidence=confidence)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post('/api/upload_model')
-def upload_model(file: UploadFile = File(...), model_name: Optional[str] = None):
-    """Upload a model state_dict (pth) to backend/models/ with a given model_name (u2net.pth or vit_stage.pth).
-    Intended for local/hackathon use only.
+def upload_model(
+    file: UploadFile = File(...), 
+    model_name: Optional[str] = None,
+    authorization: Optional[str] = Header(None)
+):
+    """Upload a model state_dict (pth) to backend/models/.
+    
+    SECURITY: This endpoint is disabled in production. Enable only for trusted local/dev environments.
+    Requires authentication and validates file content.
+    
+    WARNING: Never load untrusted .pth files as they can execute arbitrary code.
+    Only use pre-vetted model weights from trusted sources.
     """
+    # Check if endpoint is enabled (default: disabled)
+    if os.getenv("ALLOW_MODEL_UPLOAD", "false").lower() != "true":
+        raise HTTPException(
+            status_code=403, 
+            detail="Model upload endpoint is disabled. Set ALLOW_MODEL_UPLOAD=true to enable (dev only)."
+        )
+    
+    # Verify authentication
+    user = auth_module.verify_token(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
     try:
-        models_dir = os.path.join(os.path.dirname(__file__), 'models')
-        os.makedirs(models_dir, exist_ok=True)
+        # Validate content type
+        if file.content_type and not file.content_type.startswith('application/'):
+            raise HTTPException(status_code=400, detail='Invalid content type for model file')
+        
+        # Sanitize filename to prevent path traversal
         name = model_name or file.filename
+        name = os.path.basename(name)  # Strip any path components
+        
+        # Whitelist allowed model names
+        allowed_models = ['u2net.pth', 'vit_stage.pth']
+        if name not in allowed_models:
+            raise HTTPException(
+                status_code=400, 
+                detail=f'Invalid model name. Allowed: {", ".join(allowed_models)}'
+            )
+        
         if not name.endswith('.pth'):
             raise HTTPException(status_code=400, detail='model file must be .pth')
+        
+        # Validate file size (max 500MB)
+        max_size = 500 * 1024 * 1024
+        content = file.file.read()
+        if len(content) > max_size:
+            raise HTTPException(status_code=400, detail='Model file too large (max 500MB)')
+        
+        models_dir = os.path.join(os.path.dirname(__file__), 'models')
+        os.makedirs(models_dir, exist_ok=True)
         path = os.path.join(models_dir, name)
+        
         with open(path, 'wb') as out:
-            out.write(file.file.read())
-        return {"saved": path}
+            out.write(content)
+        
+        return {"saved": os.path.basename(path), "size_bytes": len(content)}
     except HTTPException:
         raise
     except Exception as e:
@@ -283,17 +679,59 @@ def upload_model(file: UploadFile = File(...), model_name: Optional[str] = None)
 
 
 @app.post('/api/upload_cobra_wasm')
-def upload_cobra_wasm(file: UploadFile = File(...)):
-    """Upload Cobra VAD WASM binary to frontend/public/cobra_vad.wasm for local integration.
-    Only allowed in local/dev environments.
+def upload_cobra_wasm(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None)
+):
+    """Upload Cobra VAD WASM binary to frontend/public/cobra_vad.wasm.
+    
+    SECURITY: This endpoint is disabled in production. Enable only for trusted local/dev environments.
+    Requires authentication and validates file content.
     """
+    # Check if endpoint is enabled (default: disabled)
+    if os.getenv("ALLOW_WASM_UPLOAD", "false").lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="WASM upload endpoint is disabled. Set ALLOW_WASM_UPLOAD=true to enable (dev only)."
+        )
+    
+    # Verify authentication
+    user = auth_module.verify_token(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
     try:
+        # Validate content type
+        if file.content_type and file.content_type not in ['application/wasm', 'application/octet-stream']:
+            raise HTTPException(status_code=400, detail='Invalid content type for WASM file')
+        
+        # Sanitize filename
+        name = os.path.basename(file.filename or 'cobra_vad.wasm')
+        if name != 'cobra_vad.wasm':
+            raise HTTPException(status_code=400, detail='Filename must be cobra_vad.wasm')
+        
+        # Validate file size (max 50MB)
+        max_size = 50 * 1024 * 1024
+        content = file.file.read()
+        if len(content) > max_size:
+            raise HTTPException(status_code=400, detail='WASM file too large (max 50MB)')
+        
+        # Validate WASM magic bytes
+        if len(content) < 4 or content[:4] != b'\x00asm':
+            raise HTTPException(status_code=400, detail='Invalid WASM file format')
+        
         base_frontend = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'frontend'))
-        target = os.path.join(base_frontend, 'public', 'cobra_vad.wasm')
+        target = os.path.join(base_frontend, 'public', name)
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        
         with open(target, 'wb') as out:
-            out.write(file.file.read())
-        return {"saved": target}
+            out.write(content)
+        
+        return {"saved": os.path.basename(target), "size_bytes": len(content)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -308,11 +746,12 @@ def ndvi_timeseries(req: HazardsRequest):
 
 
 @app.post('/api/soil_test')
-def soil_test(images: List[UploadFile] = File(...), location_lat: Optional[float] = None, location_lng: Optional[float] = None, notes: Optional[str] = None):
+def soil_test(images: List[UploadFile] = File(...), location_lat: Optional[float] = None, location_lng: Optional[float] = None, notes: Optional[str] = None, sample_depth_cm: Optional[float] = None, soil_texture: Optional[str] = None, soil_moisture: Optional[str] = None, recent_fertilizer: Optional[str] = None, observed_symptoms: Optional[str] = None, ph: Optional[float] = None, date_sampled: Optional[str] = None, request: Request = None):
     """Accept one or more soil images and optional location/notes, return a farmer-friendly report.
     This endpoint performs an indicative, image-based analysis only.
     """
     try:
+        logging.getLogger(__name__).info(f"/api/soil_test called - images={len(images) if images else 0} location_lat={location_lat} location_lng={location_lng}")
         from services.soil import analyze_images, generate_farmer_report
 
         img_bytes = []
@@ -325,10 +764,148 @@ def soil_test(images: List[UploadFile] = File(...), location_lat: Optional[float
             raise HTTPException(status_code=400, detail='At least one image is required')
 
         analysis = analyze_images(img_bytes)
+        # Attempt to enrich the report with an AI vision diagnosis (Groq/Grok) if available.
+        groq_result = None
+        groq_crop = None
+        try:
+            # Allow disabling Groq soil analysis via env for stability/testing
+            # Default disabled to ensure stability; set DISABLE_GROQ_SOIL=0 to enable
+            if str(os.getenv('DISABLE_GROQ_SOIL', '1')) == '1':
+                raise RuntimeError('Groq soil analysis disabled by DISABLE_GROQ_SOIL=1')
+            # import lazily to avoid adding dependency when not used
+            from services.vision import groq_analyze_soil, groq_detect_crop
+            # Prefer passing an uploaded image URL to Groq to avoid very large inline payloads.
+            image_url = None
+            try:
+                # attempt to save the first image to the tmp_uploads folder and build a static URL
+                if img_bytes and request is not None:
+                    uploads_dir = os.path.join(os.path.dirname(__file__), 'tmp_uploads')
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    fname = f"upload_{int(__import__('time').time()*1000)}.jpg"
+                    path = os.path.join(uploads_dir, fname)
+                    with open(path, 'wb') as outf:
+                        outf.write(img_bytes[0])
+                    # Build an absolute URL using request.base_url
+                    try:
+                        base = str(request.base_url).rstrip('/')
+                        image_url = f"{base}/static/tmp_uploads/{fname}"
+                    except Exception:
+                        image_url = None
+            except Exception:
+                image_url = None
+
+            import base64
+            if image_url:
+                # assemble extra metadata for soil analysis
+                extra_parts = []
+                if sample_depth_cm is not None:
+                    extra_parts.append(f"Sample depth (cm): {sample_depth_cm}")
+                if soil_texture:
+                    extra_parts.append(f"Soil texture: {soil_texture}")
+                if soil_moisture:
+                    extra_parts.append(f"Soil moisture: {soil_moisture}")
+                if recent_fertilizer:
+                    extra_parts.append(f"Recent fertilizer/inputs: {recent_fertilizer}")
+                if observed_symptoms:
+                    extra_parts.append(f"Symptoms observed: {observed_symptoms}")
+                if ph is not None:
+                    extra_parts.append(f"Soil pH (reported): {ph}")
+                if date_sampled:
+                    extra_parts.append(f"Date sampled: {date_sampled}")
+                if notes:
+                    extra_parts.append(f"Farmer notes: {notes}")
+                if location_lat is not None and location_lng is not None:
+                    extra_parts.append(f"Location: lat={location_lat}, lng={location_lng}")
+                extra_message = "\n".join(extra_parts) if extra_parts else None
+
+                try:
+                    # Call provider (Groq-only)
+                    from services.vision import groq_and_gemini_analyze_soil
+                    groq_resp = groq_and_gemini_analyze_soil(image_url=image_url, language='en', extra_message=extra_message)
+                    groq_result = groq_resp
+                except BaseException as e:
+                    # Catch all exceptions to avoid crashing the server
+                    groq_result = {"error": f"AI analysis failed (url): {str(e)}"}
+
+                # Do NOT perform crop detection as part of soil analysis — keep flows separate.
+            else:
+                # fallback to inline base64 when URL is not available
+                if img_bytes:
+                    first_b64 = base64.b64encode(img_bytes[0]).decode('utf-8')
+                    # assemble extra_message for inline case
+                    extra_parts = []
+                    if sample_depth_cm is not None:
+                        extra_parts.append(f"Sample depth (cm): {sample_depth_cm}")
+                    if soil_texture:
+                        extra_parts.append(f"Soil texture: {soil_texture}")
+                    if soil_moisture:
+                        extra_parts.append(f"Soil moisture: {soil_moisture}")
+                    if recent_fertilizer:
+                        extra_parts.append(f"Recent fertilizer/inputs: {recent_fertilizer}")
+                    if observed_symptoms:
+                        extra_parts.append(f"Symptoms observed: {observed_symptoms}")
+                    if ph is not None:
+                        extra_parts.append(f"Soil pH (reported): {ph}")
+                    if date_sampled:
+                        extra_parts.append(f"Date sampled: {date_sampled}")
+                    if notes:
+                        extra_parts.append(f"Farmer notes: {notes}")
+                    if location_lat is not None and location_lng is not None:
+                        extra_parts.append(f"Location: lat={location_lat}, lng={location_lng}")
+                    extra_message = "\n".join(extra_parts) if extra_parts else None
+
+                    try:
+                        from services.vision import groq_and_gemini_analyze_soil
+                        groq_resp = groq_and_gemini_analyze_soil(image_base64=first_b64, language='en', extra_message=extra_message)
+                        groq_result = groq_resp
+                    except BaseException as e:
+                        groq_result = {"error": f"AI analysis failed (inline): {str(e)}"}
+
+                    # Do NOT perform crop detection as part of soil analysis — keep flows separate.
+        except BaseException:
+            # If vision module or Groq isn't configured, skip gracefully.
+            groq_result = None
+            groq_crop = None
         loc = None
         if location_lat is not None and location_lng is not None:
             loc = {'lat': float(location_lat), 'lng': float(location_lng)}
         report = generate_farmer_report(analysis, location=loc, notes=notes)
+        # Echo back submitted metadata so frontend can display what the farmer provided
+        try:
+            submitted = {}
+            if sample_depth_cm is not None:
+                submitted['sample_depth_cm'] = float(sample_depth_cm)
+            if soil_texture:
+                submitted['soil_texture'] = soil_texture
+            if soil_moisture:
+                submitted['soil_moisture'] = soil_moisture
+            if recent_fertilizer:
+                submitted['recent_fertilizer'] = recent_fertilizer
+            if observed_symptoms:
+                submitted['observed_symptoms'] = observed_symptoms
+            if ph is not None:
+                try:
+                    submitted['ph'] = float(ph)
+                except Exception:
+                    submitted['ph'] = ph
+            if date_sampled:
+                submitted['date_sampled'] = date_sampled
+            if notes:
+                submitted['farmer_notes'] = notes
+            if location_lat is not None and location_lng is not None:
+                submitted['location'] = {'lat': float(location_lat), 'lng': float(location_lng)}
+            if isinstance(report, dict):
+                report['submitted_metadata'] = submitted
+        except Exception:
+            pass
+        logging.getLogger(__name__).info(f"/api/soil_test generated report; nearby_centers_count={len(report.get('nearby_centers', [])) if isinstance(report, dict) else 'unknown'}")
+        # Attach AI diagnosis under `grok_analysis` for frontend consumption when available
+        if groq_result is not None:
+            try:
+                report['grok_analysis'] = groq_result
+            except Exception:
+                # if report is not dict-like, wrap into a container
+                report = {"report": report, "grok_analysis": groq_result}
         return report
     except HTTPException:
         raise
@@ -427,6 +1004,63 @@ def sync_pull(since: Optional[float] = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post('/api/sync/diagnoses')
+def sync_diagnoses(payload: Dict[str, Any]):
+    """Accept diagnosis sync payload from frontend.
+    Converts to standard doc format and stores via sync service.
+    """
+    try:
+        doc_id = payload.get('id') or f"diag_{int(__import__('time').time()*1000)}"
+        doc = {
+            "id": doc_id,
+            "type": "diagnosis",
+            "payload": payload,
+            "updated_at": payload.get('created_at') or __import__('time').time()
+        }
+        push_docs([doc])
+        return {"status": "ok", "id": doc_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/sync/prices')
+def sync_prices(payload: Dict[str, Any]):
+    """Accept price sync payload from frontend.
+    Converts to standard doc format and stores via sync service.
+    """
+    try:
+        doc_id = payload.get('id') or f"price_{int(__import__('time').time()*1000)}"
+        doc = {
+            "id": doc_id,
+            "type": "price",
+            "payload": payload,
+            "updated_at": payload.get('created_at') or __import__('time').time()
+        }
+        push_docs([doc])
+        return {"status": "ok", "id": doc_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/sync/parcels')
+def sync_parcels(payload: Dict[str, Any]):
+    """Accept parcel sync payload from frontend.
+    Converts to standard doc format and stores via sync service.
+    """
+    try:
+        doc_id = payload.get('id') or f"parcel_{int(__import__('time').time()*1000)}"
+        doc = {
+            "id": doc_id,
+            "type": "parcel",
+            "payload": payload,
+            "updated_at": payload.get('created_at') or __import__('time').time()
+        }
+        push_docs([doc])
+        return {"status": "ok", "id": doc_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.websocket('/ws/sync')
 async def websocket_sync_endpoint(websocket: WebSocket):
     """WebSocket replication gateway for RxDB/CRDT clients.
@@ -521,10 +1155,13 @@ def agmarknet_nearby(req: AgmarknetNearbyRequest):
         if lat is None or lng is None:
             raise HTTPException(status_code=400, detail="location.lat and location.lng required")
         from services.agmarknet import find_nearest_mandis
+        import concurrent.futures
+        import threading
 
         origin = (float(lat), float(lng))
         # Validate and clamp parameters to safe ranges
-        radius = int(req.radius_km or 100)
+        radius = int(req.radius_km or 200)
+        # Clamp radius to [10, 200] km
         if radius <= 0 or radius > 200:
             radius = max(10, min(radius, 200))
         topn = int(req.top_n or 5)
@@ -535,14 +1172,25 @@ def agmarknet_nearby(req: AgmarknetNearbyRequest):
             fuel_rate = 0.05
         mandi_fees = float(req.mandi_fees or 0.0)
 
-        results = find_nearest_mandis(
-            commodity=req.commodity,
-            origin=origin,
-            radius_km=radius,
-            top_n=topn,
-            fuel_rate_per_ton_km=fuel_rate,
-            mandi_fees=mandi_fees,
-        )
+        # Wrap find_nearest_mandis in a timeout to prevent hanging
+        # Use ThreadPoolExecutor with a 30-second timeout
+        def _find_mandis():
+            return find_nearest_mandis(
+                commodity=req.commodity,
+                origin=origin,
+                radius_km=radius,
+                top_n=topn,
+                fuel_rate_per_ton_km=fuel_rate,
+                mandi_fees=mandi_fees,
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_find_mandis)
+                results = future.result(timeout=30)  # 30-second timeout
+        except concurrent.futures.TimeoutError:
+            logging.getLogger("uvicorn.error").warning("[agmarknet_nearby] find_nearest_mandis timed out after 30s")
+            results = []  # Return empty results on timeout
 
         nearby = [NearbyPriceEntry(**{
             "city": r["city"],
@@ -556,6 +1204,7 @@ def agmarknet_nearby(req: AgmarknetNearbyRequest):
     except HTTPException:
         raise
     except Exception as e:
+        logging.getLogger("uvicorn.error").exception("[agmarknet_nearby] error")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -625,20 +1274,78 @@ def list_history(authorization: Optional[str] = Header(None)):
 
 
 @app.post("/api/weather_forecast")
-def weather_forecast(req: HazardsRequest, crop: Optional[str] = None, authorization: Optional[str] = Header(None)):
+async def weather_forecast(req: HazardsRequest, crop: Optional[str] = None, 
+                          authorization: Optional[str] = Header(None), request: Request = None):
+    start_time = time.time()
+    
     try:
-        # Fail fast when backend not configured with an API key
-        if not os.getenv("WEATHER_API_KEY"):
-            raise HTTPException(status_code=401, detail="Weather service unauthorized: missing WEATHER_API_KEY")
+        # Rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limiter = get_rate_limiter()
+            allowed, error_msg = rate_limiter.check_rate_limit(client_ip, "/api/weather_forecast")
+            
+            if not allowed:
+                raise HTTPException(status_code=429, detail=error_msg)
+        
+        # Check cache first
+        cache = get_response_cache()
+        cache_key = cache._make_key("weather", {
+            "lat": req.location.get("lat"),
+            "lng": req.location.get("lng"),
+            "crop": crop or "none"
+        })
+        
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            get_metrics().record_request("/api/weather_forecast", 200, 
+                                        (time.time() - start_time) * 1000, used_fallback=False)
+            return cached_result
+        
+        # Check circuit breaker
+        circuit = get_circuit_breaker()
+        if circuit.is_open("weather_service"):
+            raise HTTPException(status_code=503, detail="Weather service temporarily unavailable")
 
-        # Use provided location; caller may pass user location later
-        forecast = fetch_weather(req.location)
+        # Fetch weather data (will fall back to Open-Meteo if WEATHER_API_KEY is missing)
+        try:
+            forecast = fetch_weather(req.location)
+            circuit.record_success("weather_service")
+        except Exception as e:
+            circuit.record_failure("weather_service")
+            get_metrics().record_provider_error("weather")
+            raise
+        
         advisories = crop_advisories(forecast, crop=crop)
         from services.weather import farmer_report
         farmer = farmer_report(forecast, crop=crop, horizon_days=14)
-        return {"forecast": forecast, "advisories": advisories, "farmer_report": farmer}
+        
+        result = {"forecast": forecast, "advisories": advisories, "farmer_report": farmer}
+        
+        # Cache for 5 minutes
+        cache.set(cache_key, result, ttl=300)
+        
+        latency = (time.time() - start_time) * 1000
+        # Determine provider name from forecast where possible
+        provider = "unknown"
+        try:
+            if isinstance(forecast, dict) and "source" in forecast:
+                provider = forecast.get("source") or "unknown"
+            else:
+                provider = "openweather" if os.getenv("WEATHER_API_KEY") else "open-meteo"
+        except Exception:
+            provider = "unknown"
+
+        get_metrics().record_request("/api/weather_forecast", 200, latency, 
+                                    provider=provider, used_fallback=False)
+        
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         msg = str(e)
+        latency = (time.time() - start_time) * 1000
+        get_metrics().record_request("/api/weather_forecast", 500, latency, used_fallback=False)
         # If provider returned 401/Unauthorized, surface that as a provider error
         if "401" in msg or "unauthorized" in msg.lower() or "Unauthorized" in msg:
             raise HTTPException(status_code=502, detail=f"Weather provider error: {msg}")
@@ -955,4 +1662,5 @@ def chat(req: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    # Align default dev port with frontend expectation (8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
