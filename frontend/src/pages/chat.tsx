@@ -43,17 +43,23 @@ export default function ChatPage() {
     // read any prefill from diagnostic
     try {
       // No prefill handling — Diagnostic modal no longer opens chat via sessionStorage.
-    if (SpeechRecognition) {
-      const r = new SpeechRecognition();
-      r.lang = 'en-IN';
-      r.interimResults = false;
-      r.maxAlternatives = 1;
-      r.onresult = (ev: any) => {
-        const t = ev.results[0][0].transcript;
-        setText((prev) => (prev ? prev + ' ' + t : t));
-      };
-      r.onend = () => setListening(false);
-      recogRef.current = r;
+      if (typeof window !== 'undefined') {
+        const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (SR) {
+          const r = new SR();
+          r.lang = 'en-IN';
+          r.interimResults = false;
+          r.maxAlternatives = 1;
+          r.onresult = (ev: any) => {
+            const t = ev.results && ev.results[0] && ev.results[0][0] && ev.results[0][0].transcript;
+            if (t) setText((prev) => (prev ? prev + ' ' + t : t));
+          };
+          r.onend = () => setListening(false);
+          recogRef.current = r;
+        }
+      }
+    } catch (e) {
+      // ignore speech setup errors
     }
   }, []);
 
