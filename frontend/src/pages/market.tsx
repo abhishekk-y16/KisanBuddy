@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useRouter } from 'next/router';
 import { getApiUrl } from '@/lib/api';
 import { Card, Button } from '@/components/ui';
+import { Modal } from '@/components/Modal';
 
 export default function MarketPage() {
   const [searchCommodity, setSearchCommodity] = useState('');
@@ -20,6 +21,21 @@ export default function MarketPage() {
   const [limitToLocation, setLimitToLocation] = useState<boolean>(true);
   const [fuelRatePerTonKm, setFuelRatePerTonKm] = useState<number>(0.05);
   const [mandiFeesPerTon, setMandiFeesPerTon] = useState<number>(0.0);
+  const [selectedMarketItem, setSelectedMarketItem] = useState<any | null>(null);
+  const [modalTotalFuelCost, setModalTotalFuelCost] = useState<string>('0');
+  const [modalQuantityQuintals, setModalQuantityQuintals] = useState<string>('10');
+  const [modalMandiFees, setModalMandiFees] = useState<string>(String(mandiFeesPerTon));
+  const [modalFuelPricePerL, setModalFuelPricePerL] = useState<string>('0');
+  const [modalKmPerL, setModalKmPerL] = useState<string>('0');
+  React.useEffect(() => {
+    if (selectedMarketItem) {
+      setModalTotalFuelCost('0');
+      setModalQuantityQuintals('10');
+      setModalMandiFees(String(mandiFeesPerTon));
+      setModalFuelPricePerL('0');
+      setModalKmPerL('0');
+    }
+  }, [selectedMarketItem, mandiFeesPerTon]);
   // expose default crop for inline MarketComponent auto-fetch
   try {
     (globalThis as any).__KISANBUDDY_DEFAULT_CROP = searchCommodity;
@@ -614,7 +630,10 @@ export default function MarketPage() {
                     {searchResults.slice(0, 10).map((result: any, idx: number) => (
                       <div 
                         key={idx} 
-                        className="p-4 bg-neutral-50 border border-neutral-200 rounded-lg hover:shadow-md transition"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setSelectedMarketItem(result)}
+                        className="p-4 bg-neutral-50 border border-neutral-200 rounded-lg hover:shadow-md transition cursor-pointer"
                       >
                         <div className="flex items-start justify-between">
                           <div className="flex-1">
@@ -648,7 +667,8 @@ export default function MarketPage() {
                             variant="ghost" 
                             size="sm"
                             className="mt-3"
-                            onClick={() => {
+                            onClick={(e:any) => {
+                              e.stopPropagation();
                               window.open(`https://www.openstreetmap.org/#map=12/${result.lat}/${result.lon}`, '_blank');
                             }}
                           >
@@ -661,6 +681,129 @@ export default function MarketPage() {
                 </div>
               </Card>
             )}
+
+              {selectedMarketItem && (
+                <Modal
+                  title={`How Effective Price Works — ${selectedMarketItem.city || 'Market'}`}
+                  subtitle={selectedMarketItem.date ? selectedMarketItem.date : ''}
+                  onClose={() => setSelectedMarketItem(null)}
+                  size="xl"
+                >
+                  <div className="space-y-4">
+                    <div>
+                      <p className="text-sm text-neutral-700 font-medium">Formula</p>
+                      <p className="text-sm text-neutral-700">Effective Price = Modal Price − Fuel Cost (per quintal) − Mandi Fees</p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs text-neutral-600 mb-1 block">Total Fuel Cost (₹ per trip)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm"
+                          value={modalTotalFuelCost}
+                          onChange={(e) => setModalTotalFuelCost(e.target.value)}
+                        />
+                        <p className="text-xs text-neutral-400 mt-1">Enter expected fuel expense for the trip to this market.</p>
+
+                        <label className="text-xs text-neutral-600 mb-1 block mt-2">Quantity Transported (quintals)</label>
+                        <input
+                          type="number"
+                          step="1"
+                          className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm"
+                          value={modalQuantityQuintals}
+                          onChange={(e) => setModalQuantityQuintals(e.target.value)}
+                        />
+                        <p className="text-xs text-neutral-400 mt-1">How many quintals you expect to carry on this trip (e.g., 10 for 1 ton).</p>
+                      </div>
+                      <div>
+                        <label className="text-xs text-neutral-600 mb-1 block">Fuel Price (₹/L)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm"
+                          value={modalFuelPricePerL}
+                          onChange={(e) => setModalFuelPricePerL(e.target.value)}
+                        />
+                        <p className="text-xs text-neutral-400 mt-1">Local fuel price per litre.</p>
+
+                        <label className="text-xs text-neutral-600 mb-1 block mt-2">Vehicle Efficiency (km/L)</label>
+                        <input
+                          type="number"
+                          step="0.1"
+                          className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm"
+                          value={modalKmPerL}
+                          onChange={(e) => setModalKmPerL(e.target.value)}
+                        />
+                        <p className="text-xs text-neutral-400 mt-1">Your vehicle's average kilometers per litre.</p>
+
+                        <div className="mt-3 flex items-center gap-2">
+                          <button
+                            className="px-3 py-2 bg-primary-600 text-white rounded-lg text-sm"
+                            onClick={() => {
+                                const dist = Number(selectedMarketItem.distance_km || 0);
+                                const roundTrip = dist * 2;
+                                const kmPerL = parseFloat(modalKmPerL) || 0;
+                                const pricePerL = parseFloat(modalFuelPricePerL) || 0;
+                                if (!kmPerL || kmPerL <= 0) return;
+                                const est = +(pricePerL * (roundTrip / kmPerL)).toFixed(2);
+                                setModalTotalFuelCost(String(est));
+                              }}
+                          >Use estimate</button>
+                          <div className="text-xs text-neutral-500">Estimated fuel = (round-trip km ÷ km/L) × ₹/L</div>
+                        </div>
+
+                        <label className="text-xs text-neutral-600 mb-1 block mt-3">Mandi Fees (₹/ton)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm"
+                          value={modalMandiFees}
+                          onChange={(e) => setModalMandiFees(e.target.value)}
+                        />
+                        <p className="text-xs text-neutral-400 mt-1">Enter fees you expect to pay at this mandi.</p>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 border-t border-neutral-200">
+                      {(() => {
+                        const modalPrice = Number(selectedMarketItem.modal_price || 0);
+                        const totalFuel = parseFloat(modalTotalFuelCost || '0') || 0;
+                        const qtyQ = Math.max(1, Math.floor(parseFloat(modalQuantityQuintals || '1') || 1));
+                        const perQFuel = +(totalFuel / qtyQ).toFixed(2);
+                        const fuelCost = perQFuel;
+                        const mandiFeeQ = +((parseFloat(modalMandiFees || '0') || 0) / 10.0).toFixed(2);
+                        const computedEff = +(modalPrice - fuelCost - mandiFeeQ).toFixed(2);
+                        return (
+                          <div className="space-y-2 text-sm">
+                            <div className="flex justify-between">
+                              <span className="text-neutral-600">Modal Price:</span>
+                              <span className="font-medium">₹{modalPrice}/q</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-neutral-600">Fuel Cost (per quintal):</span>
+                              <span className="text-red-600">- ₹{fuelCost}/q</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-neutral-600">Mandi Fees:</span>
+                              <span className="text-red-600">- ₹{mandiFeeQ}/q</span>
+                            </div>
+                            <div className="flex justify-between pt-2 border-t border-neutral-300">
+                              <span className="font-semibold text-neutral-800">Effective Price:</span>
+                              <span className="font-bold text-emerald-700">₹{computedEff}/q</span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    <div className="pt-3 flex justify-end">
+                      <Button variant="secondary" onClick={() => setSelectedMarketItem(null)}>Close</Button>
+                    </div>
+                  </div>
+                </Modal>
+              )}
 
             {/* 14-Day Forecast */}
             {searchForecast && searchForecast.length > 0 && (
