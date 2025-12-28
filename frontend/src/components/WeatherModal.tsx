@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Modal } from './Modal';
 import { Button } from './ui';
+import { getHazards } from '@/lib/api';
 
 interface WeatherModalProps {
   onClose?: () => void;
@@ -51,30 +52,62 @@ export function WeatherModal({ onClose, inline = false }: WeatherModalProps) {
     return () => { mounted = false; };
   }, [location]);
 
-  const mapIframe = location ? (
-    <div className="rounded-xl overflow-hidden border">
-      <div className="px-3 py-2 bg-neutral-50 text-sm text-neutral-700">
-        {placeName ? placeName : `${location.lat.toFixed(4)}, ${location.lng.toFixed(4)}`}
-      </div>
-      <a href={`https://www.openstreetmap.org/?mlat=${location.lat}&mlon=${location.lng}#map=12/${location.lat}/${location.lng}`} target="_blank" rel="noreferrer">
-        <iframe
-          title="Map preview"
-          src={`https://www.openstreetmap.org/export/embed.html?bbox=${location.lng - 0.05}%2C${location.lat - 0.05}%2C${location.lng + 0.05}%2C${location.lat + 0.05}&layer=mapnik&marker=${location.lat}%2C${location.lng}`}
-          style={{ width: '100%', height: '240px', border: 0 }}
-        />
-      </a>
-      <p className="text-xs text-neutral-400 p-2">Map preview (OpenStreetMap). Tap map to open full map.</p>
-    </div>
-  ) : (
-    <div className="text-center py-8">
-      <p className="text-sm text-neutral-500">Location not available. Allow location access to see local hazards.</p>
-      <Button variant="primary" onClick={() => window.location.reload()}>Enable Location</Button>
-    </div>
-  );
+  const [hazards, setHazards] = useState<{ flood_risk?: number; drought_risk?: number; window_days?: number } | null>(null);
+  const [hazardsError, setHazardsError] = useState<string | null>(null);
+
+  // Fetch hazards when location is available
+  useEffect(() => {
+    let mounted = true;
+    async function loadHazards() {
+      if (!location) return;
+      try {
+        const resp = await getHazards(location);
+        if (!mounted) return;
+        if (resp.error) {
+          setHazardsError(resp.error);
+          setHazards(null);
+          return;
+        }
+        setHazards(resp.data ?? null);
+        setHazardsError(null);
+      } catch (e) {
+        if (!mounted) return;
+        setHazardsError((e as any)?.message ?? 'Failed to load hazards');
+        setHazards(null);
+      }
+    }
+    loadHazards();
+    return () => { mounted = false; };
+  }, [location]);
+
+  const mapIframe = null; // map intentionally removed — show hazards instead
 
   const content = (
     <div className="space-y-4">
-      {mapIframe}
+      <div>
+        <div className="text-sm text-neutral-500 mb-2">{placeName ? placeName : (location ? `${location.lat.toFixed(4)}, ${location.lng.toFixed(4)}` : 'Location unknown')}</div>
+        {hazardsError && (
+          <div className="text-xs text-red-600">{hazardsError}</div>
+        )}
+        {hazards ? (
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="p-4 bg-amber-50 border border-amber-200 rounded">
+              <div className="text-xs text-neutral-600">Flood Risk</div>
+              <div className="text-2xl font-semibold text-amber-700">{typeof hazards.flood_risk === 'number' ? `${Math.round(hazards.flood_risk * 100)}%` : '--'}</div>
+            </div>
+            <div className="p-4 bg-yellow-50 border border-yellow-200 rounded">
+              <div className="text-xs text-neutral-600">Drought Risk</div>
+              <div className="text-2xl font-semibold text-yellow-700">{typeof hazards.drought_risk === 'number' ? `${Math.round(hazards.drought_risk * 100)}%` : '--'}</div>
+            </div>
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded">
+              <div className="text-xs text-neutral-600">Advisory Window (days)</div>
+              <div className="text-2xl font-semibold text-slate-800">{Math.min(hazards.window_days ?? 7, 7)}</div>
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-neutral-500">No hazard data available.</div>
+        )}
+      </div>
     </div>
   );
 

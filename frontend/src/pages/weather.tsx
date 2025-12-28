@@ -12,6 +12,8 @@ type Forecast = {
   lo: number;
   rain: number;
   advisory?: string;
+  humidity?: number;
+  wind?: number;
 };
 
 function ForecastCard({ item, onSelect, selected }: { item: Forecast; onSelect: (f: Forecast) => void; selected?: boolean }) {
@@ -31,6 +33,11 @@ function ForecastCard({ item, onSelect, selected }: { item: Forecast; onSelect: 
           <div className="text-sm font-semibold text-neutral-700">{item.day}</div>
           <div className="text-xs text-neutral-500 mt-1">{item.hi}° / {item.lo}°</div>
           <div className="text-xs text-neutral-400">☔ {item.rain}%</div>
+          <div className="text-xs text-neutral-400">💧 {item.humidity ?? '--'}%</div>
+          <div className="text-xs text-neutral-400">💨 {item.wind ? (item.wind.toFixed ? item.wind.toFixed(1) : item.wind) : '--'} km/h</div>
+          {item.advisory && (
+            <div className="text-xs text-neutral-500 mt-2 px-2">{item.advisory}</div>
+          )}
         </div>
       </Card>
     </button>
@@ -108,13 +115,44 @@ export default function WeatherPage() {
             }
             const list = dailyList;
         if (Array.isArray(list) && mounted) {
+          function makeAdvisoryFor(d: any) {
+            const rain = d.rain ?? Math.round((d.pop ?? 0) * 100);
+            const wind = d.wind_speed ?? d.wind?.speed ?? 0;
+            const hi = d.temp?.max ?? d.hi ?? 0;
+            const lo = d.temp?.min ?? d.lo ?? 0;
+            const humidity = d.humidity ?? d.humidity_day ?? null;
+
+            // High priority hazards
+            if (wind > 25) return 'Strong winds expected — secure support structures and greenhouse panels.';
+            if (rain >= 70) return 'Heavy rain expected — check drainage, secure stored seed, and delay field work.';
+
+            // Moderate hazards
+            if (rain >= 30) return 'Showers likely — avoid spraying and plan operations in dry windows.';
+            if (hi >= 38) return 'High temperatures forecast — increase irrigation and monitor heat stress.';
+            if (lo <= 3) return 'Low night temperatures — protect sensitive crops from possible frost.';
+
+            // Disease risk from humidity
+            if (humidity !== null && humidity >= 80) return 'High humidity — conditions may favour fungal diseases; avoid evening irrigation and monitor crops.';
+
+            // Gusty but not extreme
+            if (wind >= 15) return 'Gusty winds expected — secure lightweight covers and check trellises.';
+
+            // Default mild advisory based on precipitation chance
+            if (rain > 0 && rain < 30) return 'Light showers possible — operations generally safe; monitor short-term updates.';
+
+            // Fallback short helpful advisory for calm conditions
+            return 'Conditions look normal — proceed with routine operations and monitor the forecast for changes.';
+          }
+
           const mapped = list.slice(0, 7).map((d: any, i: number) => ({
             day: d.day ?? d.dt_txt ?? ['Today','Tue','Wed','Thu','Fri','Sat','Sun'][i] ?? `Day ${i+1}`,
             icon: d.icon ?? (d.weather && d.weather[0] && d.weather[0].emoji) ?? '🌤️',
             hi: d.hi ?? d.temp?.max ?? Math.round((d.temp?.day ?? 30)),
             lo: d.lo ?? d.temp?.min ?? Math.round((d.temp?.night ?? 20)),
             rain: d.rain ?? Math.round((d.pop ?? 0) * 100),
-            advisory: d.advisory ?? undefined,
+            humidity: d.humidity ?? d.humidity_day ?? undefined,
+            wind: d.wind_speed ?? d.wind?.speed ?? undefined,
+            advisory: d.advisory ?? d.advisories ?? makeAdvisoryFor(d) ?? undefined,
           }));
           setForecasts(mapped.length ? mapped : sample7);
           
@@ -467,35 +505,61 @@ export default function WeatherPage() {
               </div>
             </Card>
 
-            {/* Selected Day Advisory */}
-            {selected && (
-              <Card variant="elevated" className="bg-gradient-to-br from-primary-50 to-primary-100 border-2 border-primary-200">
-                <div className="p-6">
-                  <div className="flex items-start justify-between mb-4">
-                    <div>
-                      <h3 className="text-xl font-semibold text-primary-900 mb-1">
-                        {selected.day} Advisory
-                      </h3>
-                      <div className="flex items-center gap-4 text-sm text-primary-700">
-                        <span className="flex items-center gap-1">
-                          🌡️ {selected.hi}° / {selected.lo}°
-                        </span>
-                        <span className="flex items-center gap-1">
-                          💧 {selected.rain}% Rain
-                        </span>
+                {/* Selected Day Advisory — show today's advisory by default when none selected */}
+            {
+              (() => {
+                const current = selected ?? (forecasts && forecasts.length ? forecasts[0] : null);
+                if (!current) return null;
+                return (
+                  <Card variant="elevated" className="bg-gradient-to-br from-primary-50 to-primary-100 border-2 border-primary-200">
+                    <div className="p-6">
+                      <div className="flex items-start justify-between mb-4">
+                        <div>
+                          <h3 className="text-xl font-semibold text-primary-900 mb-1">
+                            {current.day} Advisory
+                          </h3>
+                          <div className="flex items-center gap-4 text-sm text-primary-700">
+                            <span className="flex items-center gap-1">
+                              🌡️ {current.hi}° / {current.lo}°
+                            </span>
+                            <span className="flex items-center gap-1">
+                              ☔ {current.rain}%
+                            </span>
+                            <span className="flex items-center gap-1">
+                              💧 {current.humidity ?? '--'}%
+                            </span>
+                            <span className="flex items-center gap-1">
+                              💨 {current.wind ? (typeof current.wind === 'number' ? current.wind.toFixed(1) : current.wind) : '--'} km/h
+                            </span>
+                          </div>
+                        </div>
+                        <span className="text-5xl">{current.icon}</span>
+                      </div>
+                      
+                      <div className="bg-white/70 rounded-lg p-6 border border-primary-200">
+                                {current.advisory ? (
+                                  (() => {
+                                    const parts = String(current.advisory)
+                                      .split(/[\n\.;—–\-]+/) // split on common separators
+                                      .map(s => s.trim())
+                                      .filter(Boolean);
+                                    return (
+                                      <ul className="list-disc list-inside space-y-4 mt-3 sm:space-y-5">
+                                        {parts.map((p, idx) => (
+                                          <li key={idx} className="text-lg sm:text-lg font-medium text-primary-900 leading-relaxed">
+                                            {p}
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    );
+                                  })()
+                                ) : null}
                       </div>
                     </div>
-                    <span className="text-5xl">{selected.icon}</span>
-                  </div>
-                  
-                  <div className="bg-white/70 rounded-lg p-4 border border-primary-200">
-                    <p className="text-sm text-neutral-800 leading-relaxed">
-                      {selected.advisory ?? 'No specific advisory — monitor conditions and follow IBF guidelines for your crop stage.'}
-                    </p>
-                  </div>
-                </div>
-              </Card>
-            )}
+                  </Card>
+                );
+              })()
+            }
 
             {/* Weather Widget */}
             <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
