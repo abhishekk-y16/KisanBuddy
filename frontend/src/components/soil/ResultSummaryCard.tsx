@@ -30,7 +30,7 @@ export default function ResultSummaryCard({ report }: Props) {
     <section className="bg-white p-4 rounded-lg shadow-sm border border-neutral-100">
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-xl font-semibold">🌱 Soil Condition Summary</h2>
+          <h2 className="text-xl font-semibold">🌱 Soil Condition Full Summary</h2>
           {hasSummary && <p className="mt-2 text-neutral-700 text-sm">{cleanedSummary}</p>}
         </div>
 
