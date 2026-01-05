@@ -88,7 +88,7 @@ export default function SummaryCard({ report }: any) {
           {/* Natural improvements */}
           {natural && natural.length > 0 && (
             <div className="mt-6">
-              <div className="text-sm font-semibold text-neutral-800">🌿 Natural improvements</div>
+              <div className="text-sm font-semibold text-neutral-800">🌿 Natural Improvements Needed</div>
               <div className="mt-3 grid gap-3">
                 {natural.map((n: any, i: number) => (
                   <div key={i} className="p-3 bg-white rounded-lg border flex items-start gap-3">
