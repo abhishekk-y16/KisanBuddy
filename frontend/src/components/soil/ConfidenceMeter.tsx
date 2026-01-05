@@ -25,7 +25,7 @@ export default function ConfidenceMeter({ value = 0, photoOnly = false }: Props)
       </div>
       {photoOnly && (
         <div className="mt-2 text-xs text-amber-700 italic">
-          ⚠️ Photo-based analysis provides visual cues only
+          ⚠️ Photo-Based Analysis Provides Visual Cues Only
         </div>
       )}
     </div>
