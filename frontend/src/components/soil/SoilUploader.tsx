@@ -11,7 +11,7 @@ export default function SoilUploader({ previews, onFiles }: Props) {
     <div className="bg-white rounded-2xl p-6 border border-neutral-100 shadow-md">
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1">
-          <h2 className="text-2xl font-bold text-neutral-900">Soil photos</h2>
+          <h2 className="text-2xl font-bold text-neutral-900">Soil Photos</h2>
           <p className="mt-1 text-sm text-neutral-600">Upload 1–4 clear photos (daylight). Include a coin or ruler for scale.</p>
         </div>
         <div className="text-sm text-neutral-500">Tip: surface + side + scale</div>
