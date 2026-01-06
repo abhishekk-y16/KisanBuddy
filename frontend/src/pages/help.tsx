@@ -10,7 +10,7 @@ export default function HelpPage() {
         <p className="text-sm text-neutral-500 mb-6">सहायता — FAQs and contact support.</p>
 
         <div className="bg-white p-6 rounded-xl shadow-sm">
-          <p className="text-neutral-600">Placeholder for help topics, Emergency Numbers, and support chat.</p>
+          <p className="text-neutral-600">Placeholder for Help Topics, Emergency Numbers, and support chat.</p>
         </div>
 
         <div className="mt-6">
