@@ -389,7 +389,7 @@ export default function WeatherPage() {
             {/* Alerts Card */}
             <Card variant="elevated" className="bg-white/90 backdrop-blur-sm">
               <div className="p-6">
-                <h2 className="text-lg font-semibold text-neutral-800 mb-4">⚠️ Active Alerts</h2>
+                <h2 className="text-lg font-semibold text-neutral-800 mb-4">⚠️ Recent Active Alerts</h2>
                 <div className="space-y-3">
                   {impactAlerts.length > 0 ? (
                     impactAlerts.map((alert, idx) => {
