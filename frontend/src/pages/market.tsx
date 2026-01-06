@@ -303,7 +303,7 @@ export default function MarketPage() {
                     <input 
                       value={searchCommodity} 
                       onChange={(e)=>setSearchCommodity(e.target.value)} 
-                      placeholder="e.g., Wheat, Tomato" 
+                      placeholder="e.g., Wheat,Tomato" 
                       className="w-full px-3 py-2 border border-neutral-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                     />
                   </div>
