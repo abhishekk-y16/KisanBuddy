@@ -40,7 +40,7 @@ def test_agmarknet_nearby_stub(monkeypatch):
 
     monkeypatch.setattr("services.agmarknet.find_nearest_mandis", fake_find)
     payload = {
-        "commodity": "Tomato",
+        "commodity": "Tomatoo",
         "location": {"lat": 17.3850, "lng": 78.4867},
         "radius_km": 50,
         "top_n": 3,
