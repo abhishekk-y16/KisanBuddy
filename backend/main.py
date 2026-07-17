@@ -228,7 +228,7 @@ def healthz():
     return {"status": "ok"}
 
 
-# Nearby labs feature removed: endpoints for geo lookups have been deprecated.
+# Nearby labs feature removed: endpoints for geo lookups have been deprecated this is a not great project you need to workk hard.
 
 
 @app.post("/api/agents/soil_analysis")
